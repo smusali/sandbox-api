@@ -20,6 +20,8 @@ import (
 	"github.com/smusali/sandbox-api/internal/httpapi"
 	"github.com/smusali/sandbox-api/internal/oauth"
 	"github.com/smusali/sandbox-api/internal/projects"
+	"github.com/smusali/sandbox-api/internal/ratelimit"
+	"github.com/smusali/sandbox-api/internal/sandboxes"
 )
 
 // idleTimeout bounds how long an idle keep-alive connection stays open.
@@ -54,6 +56,18 @@ func run() error {
 		_ = redisClient.Close()
 	}()
 
+	admissionClient, err := openAdmissionRedis(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = admissionClient.Close()
+	}()
+	limiter, err := ratelimit.New(admissionClient, cfg.RateLimitWindow)
+	if err != nil {
+		return err
+	}
+
 	verifier := auth.NewVerifier(
 		cfg.OAuthIssuer,
 		cfg.OAuthAudience,
@@ -83,6 +97,10 @@ func run() error {
 		MaxRunningSandboxes: cfg.DefaultMaxRunningSandboxes,
 		CreationRateLimit:   cfg.DefaultCreationRateLimit,
 	}, cfg.RequestTimeout), cfg.RequestTimeout)
+	sandboxAPI := httpapi.NewSandboxes(
+		sandboxes.New(pool, queries, limiter, cfg.RequestTimeout),
+		cfg.RequestTimeout,
+	)
 
 	server := &http.Server{
 		Addr: cfg.HTTPAddr,
@@ -92,6 +110,7 @@ func run() error {
 			CreateProject: projectAPI.Create(),
 			ListProjects:  projectAPI.List(),
 			AddMember:     projectAPI.AddMember(),
+			CreateSandbox: sandboxAPI.Create(),
 		}),
 		ReadHeaderTimeout: cfg.RequestTimeout,
 		ReadTimeout:       cfg.RequestTimeout,
@@ -136,6 +155,17 @@ func openPostgres(ctx context.Context, cfg config.Config) (*pgxpool.Pool, error)
 		return nil, fmt.Errorf("ping database: %w", err)
 	}
 	return pool, nil
+}
+
+func openAdmissionRedis(ctx context.Context, cfg config.Config) (*redis.Client, error) {
+	client := redis.NewClient(ratelimit.ClientOptions(cfg.RedisAddr, cfg.RequestTimeout))
+	pingCtx, cancel := context.WithTimeout(ctx, cfg.RequestTimeout)
+	defer cancel()
+	if err := client.Ping(pingCtx).Err(); err != nil {
+		_ = client.Close()
+		return nil, fmt.Errorf("ping admission redis: %w", err)
+	}
+	return client, nil
 }
 
 func openRedis(ctx context.Context, cfg config.Config) (*redis.Client, error) {

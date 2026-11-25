@@ -46,3 +46,5 @@ Hydra keeps the OAuth client in memory. PostgreSQL data stays in the `postgres-d
 Sandbox creation uses one fixed window per project. The default allowance is 20 admitted attempts. The default window is 60 seconds. The window starts on the first admitted attempt, and later attempts do not move its expiration. Members of a project share that allowance. Distinct projects have separate allowances.
 
 A fixed window can admit a burst at the boundary between two windows. Redis data loss can reset this temporary allowance. Running occupancy stays in PostgreSQL. An admitted attempt stays consumed when quota or persistence fails. Creation fails closed when Redis cannot make a trustworthy admission decision.
+
+Each successful `POST /v1/projects/{id}/sandboxes` may create a distinct sandbox. The request is not idempotent, and an uncertain result is not retried. Running quota counts only sandboxes whose status is `running`. Stopped sandboxes do not consume it. Rate-limit exhaustion is decided before quota is evaluated.
