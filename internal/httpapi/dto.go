@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"time"
 
-	"uuid"
+	"github.com/google/uuid"
 )
 
 const (
@@ -57,6 +57,11 @@ func (t *Time) UnmarshalJSON(data []byte) error {
 // ID is a resource identifier in the public API.
 type ID struct {
 	value uuid.UUID
+}
+
+// NewID wraps a UUID that persistence has already accepted.
+func NewID(value uuid.UUID) ID {
+	return ID{value: value}
 }
 
 // ParseID accepts the hyphenated UUID form and rejects every other spelling.

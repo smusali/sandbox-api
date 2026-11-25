@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"uuid"
+	"github.com/google/uuid"
 )
 
 func TestProjectResponseUsesUTCAndPreservesFraction(t *testing.T) {
@@ -152,6 +152,9 @@ func mustID(t *testing.T, value string) ID {
 	}
 	if id.UUID() != uuid.MustParse(value) {
 		t.Fatalf("UUID = %s", id.UUID())
+	}
+	if NewID(id.UUID()) != id {
+		t.Fatalf("NewID = %s", NewID(id.UUID()))
 	}
 	return id
 }

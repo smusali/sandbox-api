@@ -14,8 +14,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/smusali/sandbox-api/internal/auth"
 	"github.com/smusali/sandbox-api/internal/config"
+	sqldb "github.com/smusali/sandbox-api/internal/db/sqlc"
 	"github.com/smusali/sandbox-api/internal/httpapi"
+	"github.com/smusali/sandbox-api/internal/oauth"
 )
 
 // idleTimeout bounds how long an idle keep-alive connection stays open.
@@ -50,9 +53,36 @@ func run() error {
 		_ = redisClient.Close()
 	}()
 
+	verifier := auth.NewVerifier(
+		cfg.OAuthIssuer,
+		cfg.OAuthAudience,
+		cfg.OAuthClientID,
+		cfg.JWKSEndpoint(),
+		cfg.RequestTimeout,
+	)
+	flow := oauth.New(
+		oauth.Settings{
+			ClientID:     cfg.OAuthClientID,
+			ClientSecret: cfg.OAuthClientSecret,
+			RedirectURI:  cfg.OAuthRedirectURI,
+			AuthURL:      cfg.AuthorizationEndpoint(),
+			TokenURL:     cfg.TokenEndpoint(),
+			Audience:     cfg.OAuthAudience,
+			StateTTL:     cfg.OAuthStateTTL,
+			Timeout:      cfg.RequestTimeout,
+		},
+		oauth.NewRedisStore(redisClient),
+		oauth.NewExchanger(cfg.OAuthClientID, cfg.OAuthClientSecret, cfg.OAuthRedirectURI, cfg.TokenEndpoint(), cfg.RequestTimeout),
+		verifier,
+		sqldb.New(pool),
+	)
+
 	server := &http.Server{
-		Addr:              cfg.HTTPAddr,
-		Handler:           httpapi.NewRouter(nil, httpapi.Routes{}),
+		Addr: cfg.HTTPAddr,
+		Handler: httpapi.NewRouter(nil, httpapi.Routes{
+			Login:    flow.Login(),
+			Callback: flow.Callback(),
+		}),
 		ReadHeaderTimeout: cfg.RequestTimeout,
 		ReadTimeout:       cfg.RequestTimeout,
 		WriteTimeout:      cfg.RequestTimeout,
