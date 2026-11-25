@@ -1,5 +1,6 @@
 // Package auth verifies Hydra-issued access tokens using a process-local
-// cache of trusted signing keys.
+// cache of trusted signing keys, and carries the registered user for a
+// request.
 package auth
 
 import (

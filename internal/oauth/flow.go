@@ -6,18 +6,16 @@ package oauth
 import (
 	"context"
 	"errors"
-	"net"
 	"net/http"
 	"net/url"
 	"time"
 
-	"github.com/jackc/pgerrcode"
-	"github.com/jackc/pgx/v5/pgconn"
 	"golang.org/x/oauth2"
 
 	"github.com/smusali/sandbox-api/internal/auth"
 	"github.com/smusali/sandbox-api/internal/db/sqlc"
 	"github.com/smusali/sandbox-api/internal/httpapi"
+	"github.com/smusali/sandbox-api/internal/postgres"
 )
 
 const (
@@ -307,7 +305,7 @@ func mapVerify(err error) *failure {
 }
 
 func mapUsers(err error) *failure {
-	if postgresUnavailable(err) {
+	if postgres.Unavailable(err) {
 		return dependencyDown(false)
 	}
 	return internalFailure()
@@ -326,26 +324,4 @@ func cookieIsSecure(redirectURI string) bool {
 		return true
 	}
 	return parsed.Scheme == "https"
-}
-
-func postgresUnavailable(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-		return true
-	}
-	var netErr net.Error
-	if errors.As(err, &netErr) {
-		return true
-	}
-	var pgErr *pgconn.PgError
-	if !errors.As(err, &pgErr) || pgErr == nil {
-		return false
-	}
-	return pgerrcode.IsConnectionException(pgErr.Code) ||
-		pgerrcode.IsInsufficientResources(pgErr.Code) ||
-		pgErr.Code == pgerrcode.AdminShutdown ||
-		pgErr.Code == pgerrcode.CrashShutdown ||
-		pgErr.Code == pgerrcode.CannotConnectNow
 }

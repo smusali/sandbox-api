@@ -60,6 +60,7 @@ func run() error {
 		cfg.JWKSEndpoint(),
 		cfg.RequestTimeout,
 	)
+	queries := sqldb.New(pool)
 	flow := oauth.New(
 		oauth.Settings{
 			ClientID:     cfg.OAuthClientID,
@@ -74,12 +75,12 @@ func run() error {
 		oauth.NewRedisStore(redisClient),
 		oauth.NewExchanger(cfg.OAuthClientID, cfg.OAuthClientSecret, cfg.OAuthRedirectURI, cfg.TokenEndpoint(), cfg.RequestTimeout),
 		verifier,
-		sqldb.New(pool),
+		queries,
 	)
 
 	server := &http.Server{
 		Addr: cfg.HTTPAddr,
-		Handler: httpapi.NewRouter(nil, httpapi.Routes{
+		Handler: httpapi.NewRouter(httpapi.Authenticate(verifier, queries, cfg.RequestTimeout), httpapi.Routes{
 			Login:    flow.Login(),
 			Callback: flow.Callback(),
 		}),
