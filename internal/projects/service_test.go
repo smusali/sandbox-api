@@ -2,9 +2,11 @@ package projects
 
 import (
 	"context"
+	"errors"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -146,6 +148,203 @@ func TestServiceCreateAndList(t *testing.T) {
 	}
 }
 
+func TestServiceMembership(t *testing.T) {
+	ctx := context.Background()
+	pool := newProjectDB(t)
+	queries := sqldb.New(pool)
+	svc := New(pool, queries, Limits{MaxRunningSandboxes: 10, CreationRateLimit: 20}, 5*time.Second)
+
+	owner := insertUser(t, ctx, queries, "member-owner")
+	guest := insertUser(t, ctx, queries, "member-guest")
+	other := insertUser(t, ctx, queries, "member-other")
+	stranger := insertUser(t, ctx, queries, "member-stranger")
+	further := insertUser(t, ctx, queries, "member-further")
+
+	project, err := svc.Create(ctx, owner.ID, "Shared")
+	if err != nil {
+		t.Fatalf("Create() shared error = %v", err)
+	}
+	otherProject, err := svc.Create(ctx, other.ID, "Separate")
+	if err != nil {
+		t.Fatalf("Create() separate error = %v", err)
+	}
+	sandbox, err := queries.CreateSandbox(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("CreateSandbox() error = %v", err)
+	}
+	otherSandbox, err := queries.CreateSandbox(ctx, otherProject.ID)
+	if err != nil {
+		t.Fatalf("CreateSandbox() separate error = %v", err)
+	}
+	if n := countSandboxes(t, ctx, pool, project.ID); n != 1 {
+		t.Fatalf("sandboxes = %d", n)
+	}
+
+	if _, err := svc.GetAuthorizedProject(ctx, project.ID, guest.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("guest project error = %v", err)
+	}
+	if _, err := svc.GetAuthorizedSandbox(ctx, sandbox.ID, guest.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("guest sandbox error = %v", err)
+	}
+
+	added, err := svc.AddMember(ctx, owner.ID, project.ID, guest.ID)
+	if err != nil {
+		t.Fatalf("AddMember() error = %v", err)
+	}
+	if !added.Created || added.ProjectID != project.ID || added.UserID != guest.ID || added.CreatedAt.IsZero() {
+		t.Fatalf("added = %+v", added)
+	}
+	if countPair(t, ctx, pool, project.ID, guest.ID) != 1 {
+		t.Fatal("guest memberships != 1")
+	}
+
+	again, err := svc.AddMember(ctx, owner.ID, project.ID, guest.ID)
+	if err != nil {
+		t.Fatalf("AddMember() repeat error = %v", err)
+	}
+	if again.Created || !again.CreatedAt.Equal(added.CreatedAt) || again.UserID != guest.ID {
+		t.Fatalf("repeat = %+v, added = %+v", again, added)
+	}
+
+	self, err := svc.AddMember(ctx, owner.ID, project.ID, owner.ID)
+	if err != nil {
+		t.Fatalf("AddMember() self error = %v", err)
+	}
+	ownerRow, err := queries.GetProjectMember(ctx, sqldb.GetProjectMemberParams{
+		ProjectID: project.ID,
+		UserID:    owner.ID,
+	})
+	if err != nil {
+		t.Fatalf("GetProjectMember() owner error = %v", err)
+	}
+	if self.Created || !self.CreatedAt.Equal(ownerRow.CreatedAt) {
+		t.Fatalf("self = %+v, stored = %+v", self, ownerRow)
+	}
+
+	missingUser := uuid.New()
+	if _, err := svc.AddMember(ctx, owner.ID, project.ID, missingUser); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing user error = %v", err)
+	}
+	if countPair(t, ctx, pool, project.ID, missingUser) != 0 {
+		t.Fatal("missing user gained a membership")
+	}
+
+	if _, err := svc.AddMember(ctx, owner.ID, uuid.New(), guest.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing project error = %v", err)
+	}
+	if _, err := svc.AddMember(ctx, stranger.ID, project.ID, other.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("non-member error = %v", err)
+	}
+	if countPair(t, ctx, pool, project.ID, other.ID) != 0 {
+		t.Fatal("non-member added a user")
+	}
+
+	authorized, err := svc.GetAuthorizedProject(ctx, project.ID, guest.ID)
+	if err != nil {
+		t.Fatalf("GetAuthorizedProject() error = %v", err)
+	}
+	if authorized.ID != project.ID || authorized.MaxRunningSandboxes != 10 || authorized.CreationRateLimit != 20 {
+		t.Fatalf("authorized project = %+v", authorized)
+	}
+	visible, err := svc.GetAuthorizedSandbox(ctx, sandbox.ID, guest.ID)
+	if err != nil {
+		t.Fatalf("GetAuthorizedSandbox() error = %v", err)
+	}
+	if visible.ID != sandbox.ID || visible.ProjectID != project.ID {
+		t.Fatalf("visible sandbox = %+v", visible)
+	}
+	if _, err := svc.GetAuthorizedProject(ctx, otherProject.ID, guest.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("other project error = %v", err)
+	}
+	if _, err := svc.GetAuthorizedSandbox(ctx, otherSandbox.ID, guest.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("other sandbox error = %v", err)
+	}
+	if _, err := svc.GetAuthorizedProject(ctx, uuid.New(), owner.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing authorized project error = %v", err)
+	}
+	if _, err := svc.GetAuthorizedSandbox(ctx, uuid.New(), owner.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing authorized sandbox error = %v", err)
+	}
+	if n := countSandboxes(t, ctx, pool, project.ID); n != 1 {
+		t.Fatalf("sandboxes = %d", n)
+	}
+
+	next, err := svc.AddMember(ctx, guest.ID, project.ID, further.ID)
+	if err != nil {
+		t.Fatalf("AddMember() by new member error = %v", err)
+	}
+	if !next.Created || next.UserID != further.ID || next.ProjectID != project.ID {
+		t.Fatalf("further = %+v", next)
+	}
+	if _, err := svc.AddMember(ctx, further.ID, otherProject.ID, guest.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cross-project add error = %v", err)
+	}
+	if countPair(t, ctx, pool, otherProject.ID, guest.ID) != 0 {
+		t.Fatal("cross-project membership was inserted")
+	}
+}
+
+func TestAddMemberConcurrent(t *testing.T) {
+	ctx := context.Background()
+	pool := newProjectDB(t)
+	queries := sqldb.New(pool)
+	svc := New(pool, queries, Limits{MaxRunningSandboxes: 10, CreationRateLimit: 20}, 5*time.Second)
+
+	owner := insertUser(t, ctx, queries, "concurrent-owner")
+	target := insertUser(t, ctx, queries, "concurrent-target")
+	project, err := svc.Create(ctx, owner.ID, "Concurrent")
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	results := make(chan Member, 2)
+	errs := make(chan error, 2)
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			member, err := svc.AddMember(ctx, owner.ID, project.ID, target.ID)
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- member
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	close(errs)
+
+	for err := range errs {
+		t.Fatalf("AddMember() error = %v", err)
+	}
+	var created int
+	var first Member
+	seen := 0
+	for member := range results {
+		seen++
+		if seen == 1 {
+			first = member
+		}
+		if member.Created {
+			created++
+		}
+		if !member.CreatedAt.Equal(first.CreatedAt) || member.UserID != target.ID || member.ProjectID != project.ID {
+			t.Fatalf("member = %+v, first = %+v", member, first)
+		}
+	}
+	if seen != 2 || created != 1 {
+		t.Fatalf("results = %d, created = %d", seen, created)
+	}
+	if countPair(t, ctx, pool, project.ID, target.ID) != 1 {
+		t.Fatal("concurrent adds inserted more than one row")
+	}
+}
+
 func insertUser(t *testing.T, ctx context.Context, queries *sqldb.Queries, subject string) sqldb.User {
 	t.Helper()
 	user, err := queries.UpsertUser(ctx, sqldb.UpsertUserParams{
@@ -163,6 +362,24 @@ func countProjects(t *testing.T, ctx context.Context, pool *pgxpool.Pool, name s
 	var n int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM projects WHERE name = $1`, name).Scan(&n); err != nil {
 		t.Fatalf("count projects: %v", err)
+	}
+	return n
+}
+
+func countPair(t *testing.T, ctx context.Context, pool *pgxpool.Pool, projectID, userID uuid.UUID) int {
+	t.Helper()
+	var n int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM project_members WHERE project_id = $1 AND user_id = $2`, projectID, userID).Scan(&n); err != nil {
+		t.Fatalf("count membership: %v", err)
+	}
+	return n
+}
+
+func countSandboxes(t *testing.T, ctx context.Context, pool *pgxpool.Pool, projectID uuid.UUID) int {
+	t.Helper()
+	var n int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM sandboxes WHERE project_id = $1`, projectID).Scan(&n); err != nil {
+		t.Fatalf("count sandboxes: %v", err)
 	}
 	return n
 }

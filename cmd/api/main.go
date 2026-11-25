@@ -91,6 +91,7 @@ func run() error {
 			Callback:      flow.Callback(),
 			CreateProject: projectAPI.Create(),
 			ListProjects:  projectAPI.List(),
+			AddMember:     projectAPI.AddMember(),
 		}),
 		ReadHeaderTimeout: cfg.RequestTimeout,
 		ReadTimeout:       cfg.RequestTimeout,

@@ -17,13 +17,14 @@ import (
 type projectStore interface {
 	Create(ctx context.Context, userID uuid.UUID, name string) (db.Project, error)
 	List(ctx context.Context, userID uuid.UUID, page projects.Page) ([]db.Project, error)
+	AddMember(ctx context.Context, actorID, projectID, userID uuid.UUID) (projects.Member, error)
 }
 
 var _ projectStore = (*projects.Service)(nil)
 
 var errMissingPrincipal = errors.New("authenticated user is missing")
 
-// Projects serves project creation and discovery.
+// Projects serves project creation, discovery, and membership.
 type Projects struct {
 	store   projectStore
 	timeout time.Duration
@@ -42,6 +43,11 @@ func (p *Projects) Create() http.Handler {
 // List handles GET /v1/projects.
 func (p *Projects) List() http.Handler {
 	return http.HandlerFunc(p.list)
+}
+
+// AddMember handles POST /v1/projects/{projectID}/members.
+func (p *Projects) AddMember() http.Handler {
+	return http.HandlerFunc(p.addMember)
 }
 
 func (p *Projects) create(w http.ResponseWriter, r *http.Request) {
@@ -109,6 +115,36 @@ func (p *Projects) list(w http.ResponseWriter, r *http.Request) {
 	WriteProjectPage(w, http.StatusOK, NewProjectPage(items, next))
 }
 
+func (p *Projects) addMember(w http.ResponseWriter, r *http.Request) {
+	actorID, err := principalUser(r)
+	if err != nil {
+		WriteError(w, err)
+		return
+	}
+	projectID, err := PathID(r, "projectID")
+	if err != nil {
+		WriteError(w, err)
+		return
+	}
+	req, err := DecodeAddMember(w, r)
+	if err != nil {
+		WriteError(w, err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), p.timeout)
+	defer cancel()
+	member, err := p.store.AddMember(ctx, actorID, projectID.UUID(), req.UserID.UUID())
+	if err != nil {
+		WriteError(w, membershipFailure(err))
+		return
+	}
+	status := http.StatusOK
+	if member.Created {
+		status = http.StatusCreated
+	}
+	WriteMembership(w, status, NewMembership(NewID(member.ProjectID), NewID(member.UserID), member.CreatedAt))
+}
+
 func principalUser(r *http.Request) (uuid.UUID, error) {
 	principal, ok := auth.PrincipalFrom(r.Context())
 	if !ok {
@@ -132,4 +168,11 @@ func persistenceFailure(err error) error {
 		return ServiceUnavailable()
 	}
 	return err
+}
+
+func membershipFailure(err error) error {
+	if errors.Is(err, projects.ErrNotFound) {
+		return NotFound()
+	}
+	return persistenceFailure(err)
 }

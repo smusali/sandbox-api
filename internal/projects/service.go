@@ -1,4 +1,4 @@
-// Package projects creates projects and lists the projects a user belongs to.
+// Package projects creates projects, records membership, and authorizes access.
 package projects
 
 import (
@@ -13,6 +13,13 @@ import (
 
 	"github.com/smusali/sandbox-api/internal/db/sqlc"
 )
+
+// ErrNotFound means the project, sandbox, or user is missing or inaccessible.
+// Callers must treat every cause as the same result.
+var ErrNotFound = errors.New("not found")
+
+// errMembershipMissing is an insert conflict whose membership row cannot be read.
+var errMembershipMissing = errors.New("membership row missing after insert conflict")
 
 // Limits are the sandbox quota and creation allowance stored on a new project.
 type Limits struct {
@@ -32,6 +39,15 @@ type Position struct {
 type Page struct {
 	Limit int32
 	After *Position
+}
+
+// Member is one project membership.
+// Created is true only when this call inserted the row.
+type Member struct {
+	ProjectID uuid.UUID
+	UserID    uuid.UUID
+	CreatedAt time.Time
+	Created   bool
 }
 
 // Service persists projects and the memberships that make them visible.
@@ -99,6 +115,101 @@ func (s *Service) List(ctx context.Context, userID uuid.UUID, page Page) ([]db.P
 		CursorID:        page.After.ID,
 		RowLimit:        page.Limit,
 	})
+}
+
+// GetAuthorizedProject returns the project when userID is a member.
+// A missing project and a project without that membership both return ErrNotFound.
+// The result includes the project's persisted sandbox limits.
+func (s *Service) GetAuthorizedProject(ctx context.Context, projectID, userID uuid.UUID) (db.Project, error) {
+	project, err := s.queries.GetAuthorizedProject(ctx, db.GetAuthorizedProjectParams{
+		ProjectID: projectID,
+		UserID:    userID,
+	})
+	if err != nil {
+		return db.Project{}, absent(err)
+	}
+	return project, nil
+}
+
+// GetAuthorizedSandbox returns the sandbox when userID belongs to its stored project.
+// The sandbox id is the only resource identifier. A missing sandbox and a sandbox
+// in another project both return ErrNotFound.
+func (s *Service) GetAuthorizedSandbox(ctx context.Context, sandboxID, userID uuid.UUID) (db.Sandbox, error) {
+	sandbox, err := s.queries.GetAuthorizedSandbox(ctx, db.GetAuthorizedSandboxParams{
+		SandboxID: sandboxID,
+		UserID:    userID,
+	})
+	if err != nil {
+		return db.Sandbox{}, absent(err)
+	}
+	return sandbox, nil
+}
+
+// AddMember inserts a membership for an existing user.
+// The actor's membership is confirmed before the target user is read.
+// A new row has Created set. An existing row, including the actor, keeps its timestamp.
+func (s *Service) AddMember(ctx context.Context, actorID, projectID, userID uuid.UUID) (Member, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return Member{}, err
+	}
+	defer s.rollback(tx)
+
+	bound := s.queries.WithTx(tx)
+	if _, err := bound.GetAuthorizedProject(ctx, db.GetAuthorizedProjectParams{
+		ProjectID: projectID,
+		UserID:    actorID,
+	}); err != nil {
+		return Member{}, absent(err)
+	}
+	if _, err := bound.GetUserByID(ctx, userID); err != nil {
+		return Member{}, absent(err)
+	}
+
+	inserted, err := bound.AddProjectMember(ctx, db.AddProjectMemberParams{
+		ProjectID: projectID,
+		UserID:    userID,
+	})
+	if err == nil {
+		if err := tx.Commit(ctx); err != nil {
+			return Member{}, err
+		}
+		return memberFrom(inserted, true), nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return Member{}, err
+	}
+
+	existing, err := bound.GetProjectMember(ctx, db.GetProjectMemberParams{
+		ProjectID: projectID,
+		UserID:    userID,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Member{}, errMembershipMissing
+	}
+	if err != nil {
+		return Member{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Member{}, err
+	}
+	return memberFrom(existing, false), nil
+}
+
+func memberFrom(row db.ProjectMember, created bool) Member {
+	return Member{
+		ProjectID: row.ProjectID,
+		UserID:    row.UserID,
+		CreatedAt: row.CreatedAt,
+		Created:   created,
+	}
+}
+
+func absent(err error) error {
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
+	return err
 }
 
 func (s *Service) rollback(tx pgx.Tx) {

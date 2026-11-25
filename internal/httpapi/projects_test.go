@@ -221,8 +221,144 @@ func TestListProjectsRejectsInvalidQuery(t *testing.T) {
 	}
 }
 
+func TestAddMember(t *testing.T) {
+	actorID := uuid.MustParse("de498973-c030-4fc2-b075-4b5dbb421002")
+	projectID := uuid.MustParse("22222222-2222-4222-8222-222222222222")
+	targetID := uuid.MustParse("33333333-3333-4333-8333-333333333333")
+	created := time.Date(2026, 11, 24, 12, 5, 0, 0, time.UTC)
+
+	var gotActor, gotProject, gotTarget uuid.UUID
+	handler := NewProjects(fakeProjectStore{
+		addFn: func(_ context.Context, actor, project, target uuid.UUID) (projects.Member, error) {
+			gotActor, gotProject, gotTarget = actor, project, target
+			return projects.Member{
+				ProjectID: project,
+				UserID:    target,
+				CreatedAt: created,
+				Created:   true,
+			}, nil
+		},
+	}, time.Second).AddMember()
+
+	req, rec := memberRequest(projectID.String(), `{"user_id":"`+targetID.String()+`"}`)
+	handler.ServeHTTP(rec, withUser(req, actorID))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Content-Type") != "application/json" {
+		t.Fatalf("Content-Type = %q", rec.Header().Get("Content-Type"))
+	}
+	const want = `{"project_id":"22222222-2222-4222-8222-222222222222","user_id":"33333333-3333-4333-8333-333333333333","created_at":"2026-11-24T12:05:00Z"}`
+	if rec.Body.String() != want {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+	if gotActor != actorID || gotProject != projectID || gotTarget != targetID {
+		t.Fatalf("stored actor %s project %s target %s", gotActor, gotProject, gotTarget)
+	}
+
+	existing := NewProjects(fakeProjectStore{
+		addFn: func(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (projects.Member, error) {
+			return projects.Member{ProjectID: projectID, UserID: actorID, CreatedAt: created}, nil
+		},
+	}, time.Second).AddMember()
+	selfReq, selfRec := memberRequest(projectID.String(), `{"user_id":"`+actorID.String()+`"}`)
+	existing.ServeHTTP(selfRec, withUser(selfReq, actorID))
+	if selfRec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", selfRec.Code, selfRec.Body.String())
+	}
+	const kept = `{"project_id":"22222222-2222-4222-8222-222222222222","user_id":"de498973-c030-4fc2-b075-4b5dbb421002","created_at":"2026-11-24T12:05:00Z"}`
+	if selfRec.Body.String() != kept {
+		t.Fatalf("body = %s", selfRec.Body.String())
+	}
+}
+
+func TestAddMemberRejectsInvalidRequest(t *testing.T) {
+	actorID := uuid.MustParse("de498973-c030-4fc2-b075-4b5dbb421002")
+	projectID := uuid.MustParse("22222222-2222-4222-8222-222222222222")
+	tests := []struct {
+		name      string
+		projectID string
+		body      string
+	}{
+		{name: "project", projectID: "not-a-uuid", body: `{"user_id":"33333333-3333-4333-8333-333333333333"}`},
+		{name: "user", projectID: projectID.String(), body: `{}`},
+		{name: "owner field", projectID: projectID.String(), body: `{"user_id":"33333333-3333-4333-8333-333333333333","project_id":"22222222-2222-4222-8222-222222222222"}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler := NewProjects(rejectProjectStore(t), time.Second).AddMember()
+			req, rec := memberRequest(tt.projectID, tt.body)
+			handler.ServeHTTP(rec, withUser(req, actorID))
+			assertAPIError(t, rec, http.StatusBadRequest, CodeInvalidRequest, "The supplied request is invalid.")
+		})
+	}
+}
+
+func TestAddMemberNotFoundIsIdentical(t *testing.T) {
+	actorID := uuid.MustParse("de498973-c030-4fc2-b075-4b5dbb421002")
+	projectID := uuid.MustParse("22222222-2222-4222-8222-222222222222")
+	targetID := uuid.MustParse("33333333-3333-4333-8333-333333333333")
+	handler := NewProjects(fakeProjectStore{
+		addFn: func(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (projects.Member, error) {
+			return projects.Member{}, projects.ErrNotFound
+		},
+	}, time.Second).AddMember()
+
+	const want = `{"error":{"code":"NOT_FOUND","message":"The requested resource was not found."}}`
+	for _, name := range []string{"missing project", "non-member", "missing user"} {
+		t.Run(name, func(t *testing.T) {
+			req, rec := memberRequest(projectID.String(), `{"user_id":"`+targetID.String()+`"}`)
+			handler.ServeHTTP(rec, withUser(req, actorID))
+			if rec.Code != http.StatusNotFound || rec.Body.String() != want {
+				t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestAddMemberMapsPersistenceErrors(t *testing.T) {
+	actorID := uuid.MustParse("de498973-c030-4fc2-b075-4b5dbb421002")
+	projectID := uuid.MustParse("22222222-2222-4222-8222-222222222222")
+	targetID := uuid.MustParse("33333333-3333-4333-8333-333333333333")
+	tests := []struct {
+		name    string
+		err     error
+		status  int
+		code    Code
+		message string
+	}{
+		{
+			name:    "unavailable",
+			err:     context.DeadlineExceeded,
+			status:  http.StatusServiceUnavailable,
+			code:    CodeServiceUnavailable,
+			message: "A required service is unavailable.",
+		},
+		{
+			name:    "failed insert",
+			err:     errors.New("insert failed"),
+			status:  http.StatusInternalServerError,
+			code:    CodeInternalError,
+			message: "The request could not be completed.",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler := NewProjects(fakeProjectStore{
+				addFn: func(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (projects.Member, error) {
+					return projects.Member{}, tt.err
+				},
+			}, time.Second).AddMember()
+			req, rec := memberRequest(projectID.String(), `{"user_id":"`+targetID.String()+`"}`)
+			handler.ServeHTTP(rec, withUser(req, actorID))
+			assertAPIError(t, rec, tt.status, tt.code, tt.message)
+		})
+	}
+}
+
 func TestProjectHandlersRequirePrincipal(t *testing.T) {
 	handlers := NewProjects(rejectProjectStore(t), time.Second)
+	memberReq, _ := memberRequest("22222222-2222-4222-8222-222222222222", `{"user_id":"33333333-3333-4333-8333-333333333333"}`)
 	for _, tt := range []struct {
 		name    string
 		handler http.Handler
@@ -230,6 +366,7 @@ func TestProjectHandlersRequirePrincipal(t *testing.T) {
 	}{
 		{name: "create", handler: handlers.Create(), req: httptest.NewRequest(http.MethodPost, "/v1/projects", nil)},
 		{name: "list", handler: handlers.List(), req: httptest.NewRequest(http.MethodGet, "/v1/projects", nil)},
+		{name: "member", handler: handlers.AddMember(), req: memberReq},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			rec := httptest.NewRecorder()
@@ -251,9 +388,16 @@ func TestListProjectsMapsPersistenceErrors(t *testing.T) {
 	assertAPIError(t, rec, http.StatusServiceUnavailable, CodeServiceUnavailable, "A required service is unavailable.")
 }
 
+func memberRequest(projectID, body string) (*http.Request, *httptest.ResponseRecorder) {
+	req, rec := bodyRequest(http.MethodPost, "/v1/projects/"+projectID+"/members", "application/json", body)
+	req.SetPathValue("projectID", projectID)
+	return req, rec
+}
+
 type fakeProjectStore struct {
 	createFn func(context.Context, uuid.UUID, string) (db.Project, error)
 	listFn   func(context.Context, uuid.UUID, projects.Page) ([]db.Project, error)
+	addFn    func(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (projects.Member, error)
 }
 
 func (f fakeProjectStore) Create(ctx context.Context, userID uuid.UUID, name string) (db.Project, error) {
@@ -262,6 +406,10 @@ func (f fakeProjectStore) Create(ctx context.Context, userID uuid.UUID, name str
 
 func (f fakeProjectStore) List(ctx context.Context, userID uuid.UUID, page projects.Page) ([]db.Project, error) {
 	return f.listFn(ctx, userID, page)
+}
+
+func (f fakeProjectStore) AddMember(ctx context.Context, actorID, projectID, userID uuid.UUID) (projects.Member, error) {
+	return f.addFn(ctx, actorID, projectID, userID)
 }
 
 func rejectProjectStore(t *testing.T) fakeProjectStore {
@@ -276,6 +424,11 @@ func rejectProjectStore(t *testing.T) fakeProjectStore {
 			t.Helper()
 			t.Fatal("list called")
 			return nil, nil
+		},
+		addFn: func(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (projects.Member, error) {
+			t.Helper()
+			t.Fatal("add member called")
+			return projects.Member{}, nil
 		},
 	}
 }
