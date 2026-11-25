@@ -1,6 +1,7 @@
 package sandboxes
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/url"
@@ -334,6 +335,160 @@ func TestCreateCancelsWhileProjectLocked(t *testing.T) {
 	}
 }
 
+func TestListProjectSandboxes(t *testing.T) {
+	ctx := context.Background()
+	pool := newSandboxDB(t)
+	queries := sqldb.New(pool)
+	admit := &fakeAdmitter{allow: denyAfter(24 * time.Second)}
+	svc := New(pool, queries, admit, 5*time.Second)
+
+	owner := insertUser(t, ctx, queries, "list-owner")
+	guest := insertUser(t, ctx, queries, "list-guest")
+	stranger := insertUser(t, ctx, queries, "list-stranger")
+	otherOwner := insertUser(t, ctx, queries, "list-other")
+	project := insertProject(t, ctx, queries, owner.ID, "Agent", 10, 20)
+	other := insertProject(t, ctx, queries, otherOwner.ID, "Other", 10, 20)
+
+	empty, err := svc.List(ctx, owner.ID, project.ID, Page{Limit: 50})
+	if err != nil {
+		t.Fatalf("List() empty error = %v", err)
+	}
+	if empty == nil || len(empty) != 0 {
+		t.Fatalf("empty sandboxes = %#v", empty)
+	}
+
+	firstTie, err := queries.CreateSandbox(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("CreateSandbox() first error = %v", err)
+	}
+	secondTie, err := queries.CreateSandbox(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("CreateSandbox() second error = %v", err)
+	}
+	stoppedRow, err := queries.CreateSandbox(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("CreateSandbox() stopped error = %v", err)
+	}
+	affected, err := queries.StopRunningSandbox(ctx, sqldb.StopRunningSandboxParams{
+		ID:        stoppedRow.ID,
+		ProjectID: project.ID,
+	})
+	if err != nil {
+		t.Fatalf("StopRunningSandbox() error = %v", err)
+	}
+	if affected != 1 {
+		t.Fatalf("stopped rows = %d", affected)
+	}
+	foreign, err := queries.CreateSandbox(ctx, other.ID)
+	if err != nil {
+		t.Fatalf("CreateSandbox() foreign error = %v", err)
+	}
+
+	shared := time.Date(2026, 11, 24, 12, 10, 0, 0, time.UTC)
+	older := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	ahead := shared.Add(time.Minute)
+	if err := setSandboxCreatedAt(ctx, pool, firstTie.ID, shared); err != nil {
+		t.Fatal(err)
+	}
+	if err := setSandboxCreatedAt(ctx, pool, secondTie.ID, shared); err != nil {
+		t.Fatal(err)
+	}
+	if err := setSandboxCreatedAt(ctx, pool, stoppedRow.ID, older); err != nil {
+		t.Fatal(err)
+	}
+	if err := setSandboxCreatedAt(ctx, pool, foreign.ID, ahead); err != nil {
+		t.Fatal(err)
+	}
+	leading, following := orderedSandboxIDs(firstTie.ID, secondTie.ID)
+
+	page, err := svc.List(ctx, owner.ID, project.ID, Page{Limit: 1})
+	if err != nil {
+		t.Fatalf("List() first page error = %v", err)
+	}
+	if len(page) != 1 || page[0].ID != leading || page[0].ProjectID != project.ID || page[0].Status != "running" || page[0].StoppedAt != nil {
+		t.Fatalf("first page = %+v", page)
+	}
+
+	rest, err := svc.List(ctx, owner.ID, project.ID, Page{
+		Limit: 10,
+		After: &Position{CreatedAt: page[0].CreatedAt, ID: page[0].ID},
+	})
+	if err != nil {
+		t.Fatalf("List() second page error = %v", err)
+	}
+	if len(rest) != 2 || rest[0].ID != following || rest[0].Status != "running" || rest[0].StoppedAt != nil {
+		t.Fatalf("second page head = %+v", rest)
+	}
+	if rest[1].ID != stoppedRow.ID || rest[1].Status != "stopped" || rest[1].StoppedAt == nil || rest[1].StoppedAt.Before(rest[1].CreatedAt) {
+		t.Fatalf("stopped sandbox = %+v", rest[1])
+	}
+	for _, row := range append(page, rest...) {
+		if row.ID == foreign.ID || row.ProjectID != project.ID {
+			t.Fatalf("foreign sandbox listed: %+v", row)
+		}
+	}
+
+	otherPage, err := svc.List(ctx, otherOwner.ID, other.ID, Page{Limit: 50})
+	if err != nil {
+		t.Fatalf("List() other error = %v", err)
+	}
+	if len(otherPage) != 1 || otherPage[0].ID != foreign.ID {
+		t.Fatalf("other page = %+v", otherPage)
+	}
+
+	if _, err := queries.AddProjectMember(ctx, sqldb.AddProjectMemberParams{
+		ProjectID: project.ID,
+		UserID:    guest.ID,
+	}); err != nil {
+		t.Fatalf("AddProjectMember() error = %v", err)
+	}
+	guestPage, err := svc.List(ctx, guest.ID, project.ID, Page{Limit: 50})
+	if err != nil {
+		t.Fatalf("List() guest error = %v", err)
+	}
+	if len(guestPage) != 3 || guestPage[0].ID != leading || guestPage[1].ID != following || guestPage[2].ID != stoppedRow.ID {
+		t.Fatalf("guest page = %+v", guestPage)
+	}
+
+	if _, err := svc.List(ctx, stranger.ID, project.ID, Page{Limit: 50}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("stranger error = %v", err)
+	}
+	if _, err := svc.List(ctx, owner.ID, uuid.New(), Page{Limit: 50}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing project error = %v", err)
+	}
+	if calls := admit.snapshot(); len(calls) != 0 {
+		t.Fatalf("admission = %+v", calls)
+	}
+}
+
+func TestListSkipsUnavailableAdmission(t *testing.T) {
+	ctx := context.Background()
+	pool := newSandboxDB(t)
+	queries := sqldb.New(pool)
+	admit := &fakeAdmitter{allow: func(uuid.UUID, int32) (ratelimit.Decision, error) {
+		return ratelimit.Decision{}, ratelimit.ErrUnavailable
+	}}
+	svc := New(pool, queries, admit, 5*time.Second)
+
+	owner := insertUser(t, ctx, queries, "list-unavailable")
+	project := insertProject(t, ctx, queries, owner.ID, "Agent", 10, 20)
+	created, err := queries.CreateSandbox(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("CreateSandbox() error = %v", err)
+	}
+
+	page, err := svc.List(ctx, owner.ID, project.ID, Page{Limit: 50})
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(page) != 1 || page[0].ID != created.ID || page[0].Status != "running" {
+		t.Fatalf("page = %+v", page)
+	}
+	if calls := admit.snapshot(); len(calls) != 0 {
+		t.Fatalf("admission = %+v", calls)
+	}
+}
+
 type admitCall struct {
 	projectID uuid.UUID
 	limit     int32
@@ -399,6 +554,26 @@ func insertProject(t *testing.T, ctx context.Context, queries *sqldb.Queries, us
 		t.Fatalf("AddProjectMember() error = %v", err)
 	}
 	return project
+}
+
+func orderedSandboxIDs(left, right uuid.UUID) (leading, following uuid.UUID) {
+	if bytes.Compare(left[:], right[:]) >= 0 {
+		return left, right
+	}
+	return right, left
+}
+
+func setSandboxCreatedAt(ctx context.Context, pool *pgxpool.Pool, id uuid.UUID, createdAt time.Time) error {
+	_, err := pool.Exec(ctx, `
+		UPDATE sandboxes
+		SET created_at = $2,
+		    stopped_at = CASE
+		        WHEN status = 'stopped' THEN GREATEST(stopped_at, $2)
+		        ELSE stopped_at
+		    END
+		WHERE id = $1
+	`, id, createdAt)
+	return err
 }
 
 func seedRunning(t *testing.T, ctx context.Context, queries *sqldb.Queries, projectID uuid.UUID, n int64) {

@@ -111,6 +111,7 @@ func run() error {
 			ListProjects:  projectAPI.List(),
 			AddMember:     projectAPI.AddMember(),
 			CreateSandbox: sandboxAPI.Create(),
+			ListSandboxes: sandboxAPI.List(),
 		}),
 		ReadHeaderTimeout: cfg.RequestTimeout,
 		ReadTimeout:       cfg.RequestTimeout,

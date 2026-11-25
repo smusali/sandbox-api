@@ -1,4 +1,4 @@
-// Package sandboxes creates running sandboxes under a project's rate allowance and quota.
+// Package sandboxes creates running sandboxes and lists project sandbox records.
 package sandboxes
 
 import (
@@ -40,7 +40,21 @@ type admitter interface {
 
 var _ admitter = (*ratelimit.Limiter)(nil)
 
-// Service persists running sandboxes for authorized project members.
+// Position is the creation time and id a later page continues after.
+type Position struct {
+	CreatedAt time.Time
+	ID        uuid.UUID
+}
+
+// Page is one sandbox list read.
+// Limit is the number of rows to read.
+// A nil After starts at the newest sandbox.
+type Page struct {
+	Limit int32
+	After *Position
+}
+
+// Service creates and lists sandboxes for authorized project members.
 type Service struct {
 	pool    *pgxpool.Pool
 	queries *db.Queries
@@ -99,6 +113,31 @@ func (s *Service) Create(ctx context.Context, userID, projectID uuid.UUID) (db.S
 		return db.Sandbox{}, err
 	}
 	return created, nil
+}
+
+// List returns one page of the project's sandboxes, newest first.
+// The caller must be a member. Running and stopped rows are included.
+// page.Limit is the number of rows to read. A nil page.After starts at the newest sandbox.
+// Listing does not consume creation allowance and does not lock the project.
+func (s *Service) List(ctx context.Context, userID, projectID uuid.UUID, page Page) ([]db.Sandbox, error) {
+	if _, err := s.queries.GetAuthorizedProject(ctx, db.GetAuthorizedProjectParams{
+		ProjectID: projectID,
+		UserID:    userID,
+	}); err != nil {
+		return nil, absent(err)
+	}
+	if page.After == nil {
+		return s.queries.ListProjectSandboxes(ctx, db.ListProjectSandboxesParams{
+			ProjectID: projectID,
+			RowLimit:  page.Limit,
+		})
+	}
+	return s.queries.ListProjectSandboxesAfter(ctx, db.ListProjectSandboxesAfterParams{
+		ProjectID:       projectID,
+		CursorCreatedAt: page.After.CreatedAt,
+		CursorID:        page.After.ID,
+		RowLimit:        page.Limit,
+	})
 }
 
 // withLockedProject runs fn while the caller's project row is locked.
