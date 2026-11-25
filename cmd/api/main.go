@@ -15,6 +15,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/smusali/sandbox-api/internal/config"
+	"github.com/smusali/sandbox-api/internal/httpapi"
 )
 
 // idleTimeout bounds how long an idle keep-alive connection stays open.
@@ -51,7 +52,7 @@ func run() error {
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           http.NewServeMux(),
+		Handler:           httpapi.NewRouter(nil, httpapi.Routes{}),
 		ReadHeaderTimeout: cfg.RequestTimeout,
 		ReadTimeout:       cfg.RequestTimeout,
 		WriteTimeout:      cfg.RequestTimeout,
