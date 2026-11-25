@@ -489,6 +489,342 @@ func TestListSkipsUnavailableAdmission(t *testing.T) {
 	}
 }
 
+func TestStopRunningSandbox(t *testing.T) {
+	ctx := context.Background()
+	pool := newSandboxDB(t)
+	queries := sqldb.New(pool)
+	admit := &fakeAdmitter{allow: denyAfter(24 * time.Second)}
+	svc := New(pool, queries, admit, 5*time.Second)
+
+	owner := insertUser(t, ctx, queries, "owner")
+	project := insertProject(t, ctx, queries, owner.ID, "Agent", 10, 20)
+	created, err := queries.CreateSandbox(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("CreateSandbox() error = %v", err)
+	}
+
+	if err := svc.Stop(ctx, owner.ID, created.ID); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+	stopped, err := queries.GetAuthorizedSandbox(ctx, sqldb.GetAuthorizedSandboxParams{
+		SandboxID: created.ID,
+		UserID:    owner.ID,
+	})
+	if err != nil {
+		t.Fatalf("GetAuthorizedSandbox() error = %v", err)
+	}
+	if stopped.Status != "stopped" || stopped.StoppedAt == nil || stopped.StoppedAt.Before(stopped.CreatedAt) {
+		t.Fatalf("stopped sandbox = %+v", stopped)
+	}
+	if running := countRunning(t, ctx, queries, project.ID); running != 0 {
+		t.Fatalf("running = %d", running)
+	}
+
+	if err := svc.Stop(ctx, owner.ID, created.ID); err != nil {
+		t.Fatalf("Stop() repeat error = %v", err)
+	}
+	repeated, err := queries.GetAuthorizedSandbox(ctx, sqldb.GetAuthorizedSandboxParams{
+		SandboxID: created.ID,
+		UserID:    owner.ID,
+	})
+	if err != nil {
+		t.Fatalf("GetAuthorizedSandbox() repeat error = %v", err)
+	}
+	if repeated.StoppedAt == nil || !repeated.StoppedAt.Equal(*stopped.StoppedAt) || repeated.Status != "stopped" {
+		t.Fatalf("repeated sandbox = %+v", repeated)
+	}
+	if running := countRunning(t, ctx, queries, project.ID); running != 0 {
+		t.Fatalf("running after repeat = %d", running)
+	}
+	if calls := admit.snapshot(); len(calls) != 0 {
+		t.Fatalf("admission = %+v", calls)
+	}
+}
+
+func TestStopAuthorization(t *testing.T) {
+	ctx := context.Background()
+	pool := newSandboxDB(t)
+	queries := sqldb.New(pool)
+	svc := New(pool, queries, &fakeAdmitter{}, 5*time.Second)
+
+	owner := insertUser(t, ctx, queries, "owner")
+	guest := insertUser(t, ctx, queries, "guest")
+	stranger := insertUser(t, ctx, queries, "stranger")
+	project := insertProject(t, ctx, queries, owner.ID, "Agent", 10, 20)
+	created, err := queries.CreateSandbox(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("CreateSandbox() error = %v", err)
+	}
+	if _, err := queries.AddProjectMember(ctx, sqldb.AddProjectMemberParams{
+		ProjectID: project.ID,
+		UserID:    guest.ID,
+	}); err != nil {
+		t.Fatalf("AddProjectMember() error = %v", err)
+	}
+
+	if err := svc.Stop(ctx, stranger.ID, created.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("stranger error = %v", err)
+	}
+	if err := svc.Stop(ctx, owner.ID, uuid.New()); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing sandbox error = %v", err)
+	}
+	if running := countRunning(t, ctx, queries, project.ID); running != 1 {
+		t.Fatalf("running = %d", running)
+	}
+
+	if err := svc.Stop(ctx, guest.ID, created.ID); err != nil {
+		t.Fatalf("Stop() guest error = %v", err)
+	}
+	if running := countRunning(t, ctx, queries, project.ID); running != 0 {
+		t.Fatalf("running after guest = %d", running)
+	}
+}
+
+func TestStopReleasesCapacity(t *testing.T) {
+	ctx := context.Background()
+	pool := newSandboxDB(t)
+	queries := sqldb.New(pool)
+	admit := &fakeAdmitter{}
+	svc := New(pool, queries, admit, 5*time.Second)
+
+	owner := insertUser(t, ctx, queries, "owner")
+	project := insertProject(t, ctx, queries, owner.ID, "Full", 1, 20)
+	created, err := queries.CreateSandbox(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("CreateSandbox() error = %v", err)
+	}
+
+	if _, err := svc.Create(ctx, owner.ID, project.ID); !errors.Is(err, ErrQuotaExceeded) {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if err := svc.Stop(ctx, owner.ID, created.ID); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+	if running := countRunning(t, ctx, queries, project.ID); running != 0 {
+		t.Fatalf("running = %d", running)
+	}
+	replacement, err := svc.Create(ctx, owner.ID, project.ID)
+	if err != nil {
+		t.Fatalf("Create() after stop error = %v", err)
+	}
+	if replacement.ID == created.ID || replacement.Status != "running" || replacement.StoppedAt != nil {
+		t.Fatalf("sandbox = %+v", replacement)
+	}
+	if running := countRunning(t, ctx, queries, project.ID); running != 1 {
+		t.Fatalf("running after create = %d", running)
+	}
+	calls := admit.snapshot()
+	if len(calls) != 2 || calls[0].projectID != project.ID || calls[1].projectID != project.ID {
+		t.Fatalf("admission = %+v", calls)
+	}
+}
+
+func TestStopSkipsAdmission(t *testing.T) {
+	ctx := context.Background()
+	pool := newSandboxDB(t)
+	queries := sqldb.New(pool)
+
+	owner := insertUser(t, ctx, queries, "owner")
+	tests := []struct {
+		name  string
+		allow func(uuid.UUID, int32) (ratelimit.Decision, error)
+	}{
+		{name: "denied", allow: denyAfter(24 * time.Second)},
+		{name: "unavailable", allow: func(uuid.UUID, int32) (ratelimit.Decision, error) {
+			return ratelimit.Decision{}, ratelimit.ErrUnavailable
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			admit := &fakeAdmitter{allow: tt.allow}
+			svc := New(pool, queries, admit, 5*time.Second)
+			project := insertProject(t, ctx, queries, owner.ID, tt.name, 1, 20)
+			created, err := queries.CreateSandbox(ctx, project.ID)
+			if err != nil {
+				t.Fatalf("CreateSandbox() error = %v", err)
+			}
+			if err := svc.Stop(ctx, owner.ID, created.ID); err != nil {
+				t.Fatalf("Stop() error = %v", err)
+			}
+			if running := countRunning(t, ctx, queries, project.ID); running != 0 {
+				t.Fatalf("running = %d", running)
+			}
+			if calls := admit.snapshot(); len(calls) != 0 {
+				t.Fatalf("admission = %+v", calls)
+			}
+		})
+	}
+}
+
+func TestStopConcurrentSameSandbox(t *testing.T) {
+	ctx := context.Background()
+	pool := newSandboxDB(t)
+	queries := sqldb.New(pool)
+	svc := New(pool, queries, &fakeAdmitter{}, 5*time.Second)
+
+	owner := insertUser(t, ctx, queries, "owner")
+	guest := insertUser(t, ctx, queries, "guest")
+	project := insertProject(t, ctx, queries, owner.ID, "Shared", 10, 20)
+	if _, err := queries.AddProjectMember(ctx, sqldb.AddProjectMemberParams{
+		ProjectID: project.ID,
+		UserID:    guest.ID,
+	}); err != nil {
+		t.Fatalf("AddProjectMember() error = %v", err)
+	}
+	created, err := queries.CreateSandbox(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("CreateSandbox() error = %v", err)
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var stopErr error
+	for _, userID := range []uuid.UUID{owner.ID, guest.ID} {
+		wg.Add(1)
+		go func(userID uuid.UUID) {
+			defer wg.Done()
+			<-start
+			err := svc.Stop(ctx, userID, created.ID)
+			if err == nil {
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if stopErr == nil {
+				stopErr = err
+			}
+		}(userID)
+	}
+	close(start)
+	wg.Wait()
+	if stopErr != nil {
+		t.Fatalf("Stop() error = %v", stopErr)
+	}
+	if running := countRunning(t, ctx, queries, project.ID); running != 0 {
+		t.Fatalf("running = %d", running)
+	}
+	stopped, err := queries.GetAuthorizedSandbox(ctx, sqldb.GetAuthorizedSandboxParams{
+		SandboxID: created.ID,
+		UserID:    owner.ID,
+	})
+	if err != nil {
+		t.Fatalf("GetAuthorizedSandbox() error = %v", err)
+	}
+	if stopped.Status != "stopped" || stopped.StoppedAt == nil || stopped.StoppedAt.Before(stopped.CreatedAt) {
+		t.Fatalf("stopped sandbox = %+v", stopped)
+	}
+}
+
+func TestStopConcurrentDistinctSandboxes(t *testing.T) {
+	ctx := context.Background()
+	pool := newSandboxDB(t)
+	queries := sqldb.New(pool)
+	svc := New(pool, queries, &fakeAdmitter{}, 5*time.Second)
+
+	owner := insertUser(t, ctx, queries, "owner")
+	project := insertProject(t, ctx, queries, owner.ID, "Pair", 10, 20)
+	first, err := queries.CreateSandbox(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("CreateSandbox() first error = %v", err)
+	}
+	second, err := queries.CreateSandbox(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("CreateSandbox() second error = %v", err)
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var stopErr error
+	for _, sandboxID := range []uuid.UUID{first.ID, second.ID} {
+		wg.Add(1)
+		go func(sandboxID uuid.UUID) {
+			defer wg.Done()
+			<-start
+			err := svc.Stop(ctx, owner.ID, sandboxID)
+			if err == nil {
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if stopErr == nil {
+				stopErr = err
+			}
+		}(sandboxID)
+	}
+	close(start)
+	wg.Wait()
+	if stopErr != nil {
+		t.Fatalf("Stop() error = %v", stopErr)
+	}
+	if running := countRunning(t, ctx, queries, project.ID); running != 0 {
+		t.Fatalf("running = %d", running)
+	}
+}
+
+func TestStopCancelsWhileProjectLocked(t *testing.T) {
+	ctx := context.Background()
+	pool := newSandboxDB(t)
+	queries := sqldb.New(pool)
+	svc := New(pool, queries, &fakeAdmitter{}, 5*time.Second)
+
+	owner := insertUser(t, ctx, queries, "owner")
+	project := insertProject(t, ctx, queries, owner.ID, "Locked", 10, 20)
+	created, err := queries.CreateSandbox(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("CreateSandbox() error = %v", err)
+	}
+
+	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = tx.Rollback(context.Background())
+	})
+	if _, err := queries.WithTx(tx).LockAuthorizedProject(ctx, sqldb.LockAuthorizedProjectParams{
+		ProjectID: project.ID,
+		UserID:    owner.ID,
+	}); err != nil {
+		t.Fatalf("LockAuthorizedProject() error = %v", err)
+	}
+
+	parent, stop := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stop()
+	stopCtx, cancel := context.WithCancel(parent)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- svc.Stop(stopCtx, owner.ID, created.ID)
+	}()
+	if !waitForLock(t, ctx, pool) {
+		t.Fatal("Stop() did not wait for the project lock")
+	}
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Stop() error = %v", err)
+		}
+	case <-parent.Done():
+		t.Fatal("Stop() did not return")
+	}
+	if running := countRunning(t, ctx, queries, project.ID); running != 1 {
+		t.Fatalf("running = %d", running)
+	}
+	visible, err := queries.GetAuthorizedSandbox(ctx, sqldb.GetAuthorizedSandboxParams{
+		SandboxID: created.ID,
+		UserID:    owner.ID,
+	})
+	if err != nil {
+		t.Fatalf("GetAuthorizedSandbox() error = %v", err)
+	}
+	if visible.Status != "running" || visible.StoppedAt != nil {
+		t.Fatalf("sandbox = %+v", visible)
+	}
+}
+
 type admitCall struct {
 	projectID uuid.UUID
 	limit     int32
@@ -584,6 +920,28 @@ func seedRunning(t *testing.T, ctx context.Context, queries *sqldb.Queries, proj
 			t.Fatalf("CreateSandbox() error = %v", err)
 		}
 	}
+}
+
+func waitForLock(t *testing.T, ctx context.Context, pool *pgxpool.Pool) bool {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		var waiting int
+		err := pool.QueryRow(ctx, `
+			SELECT count(*)
+			FROM pg_stat_activity
+			WHERE datname = current_database()
+			  AND wait_event_type = 'Lock'
+		`).Scan(&waiting)
+		if err != nil {
+			t.Fatalf("lock wait: %v", err)
+		}
+		if waiting > 0 {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return false
 }
 
 func countRunning(t *testing.T, ctx context.Context, queries *sqldb.Queries, projectID uuid.UUID) int64 {

@@ -17,11 +17,12 @@ import (
 type sandboxStore interface {
 	Create(ctx context.Context, userID, projectID uuid.UUID) (db.Sandbox, error)
 	List(ctx context.Context, userID, projectID uuid.UUID, page sandboxes.Page) ([]db.Sandbox, error)
+	Stop(ctx context.Context, userID, sandboxID uuid.UUID) error
 }
 
 var _ sandboxStore = (*sandboxes.Service)(nil)
 
-// Sandboxes serves sandbox creation and listing.
+// Sandboxes serves sandbox creation, listing, and termination.
 type Sandboxes struct {
 	store   sandboxStore
 	timeout time.Duration
@@ -40,6 +41,11 @@ func (s *Sandboxes) Create() http.Handler {
 // List handles GET /v1/projects/{projectID}/sandboxes.
 func (s *Sandboxes) List() http.Handler {
 	return http.HandlerFunc(s.list)
+}
+
+// Stop handles DELETE /v1/sandboxes/{sandboxID}.
+func (s *Sandboxes) Stop() http.Handler {
+	return http.HandlerFunc(s.stop)
 }
 
 func (s *Sandboxes) create(w http.ResponseWriter, r *http.Request) {
@@ -116,6 +122,30 @@ func (s *Sandboxes) list(w http.ResponseWriter, r *http.Request) {
 	WriteSandboxPage(w, http.StatusOK, NewSandboxPage(items, next))
 }
 
+func (s *Sandboxes) stop(w http.ResponseWriter, r *http.Request) {
+	userID, err := principalUser(r)
+	if err != nil {
+		WriteError(w, err)
+		return
+	}
+	sandboxID, err := PathID(r, "sandboxID")
+	if err != nil {
+		WriteError(w, err)
+		return
+	}
+	if err := RejectBody(w, r); err != nil {
+		WriteError(w, err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), s.timeout)
+	defer cancel()
+	if err := s.store.Stop(ctx, userID, sandboxID.UUID()); err != nil {
+		WriteError(w, stopFailure(err))
+		return
+	}
+	WriteNoContent(w)
+}
+
 func sandboxResponse(row db.Sandbox) Sandbox {
 	return NewSandbox(
 		NewID(row.ID),
@@ -137,6 +167,13 @@ func sandboxPage(span Span) sandboxes.Page {
 }
 
 func listFailure(err error) error {
+	if errors.Is(err, sandboxes.ErrNotFound) {
+		return NotFound()
+	}
+	return persistenceFailure(err)
+}
+
+func stopFailure(err error) error {
 	if errors.Is(err, sandboxes.ErrNotFound) {
 		return NotFound()
 	}

@@ -353,11 +353,120 @@ func TestListSandboxesMapsErrors(t *testing.T) {
 	}
 }
 
+func TestStopSandbox(t *testing.T) {
+	userID := uuid.MustParse("de498973-c030-4fc2-b075-4b5dbb421002")
+	sandboxID := uuid.MustParse("44444444-4444-4444-8444-444444444444")
+	var gotUser uuid.UUID
+	var gotSandbox uuid.UUID
+	handler := NewSandboxes(fakeSandboxStore{
+		stopFn: func(_ context.Context, user, sandbox uuid.UUID) error {
+			gotUser = user
+			gotSandbox = sandbox
+			return nil
+		},
+	}, time.Second).Stop()
+
+	req, rec := stopSandboxRequest(sandboxID.String(), "")
+	handler.ServeHTTP(rec, withUser(req, userID))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("body = %q", rec.Body.String())
+	}
+	if rec.Header().Get("Content-Type") != "" {
+		t.Fatalf("Content-Type = %q", rec.Header().Get("Content-Type"))
+	}
+	if gotUser != userID || gotSandbox != sandboxID {
+		t.Fatalf("stored user %s sandbox %s", gotUser, gotSandbox)
+	}
+}
+
+func TestStopSandboxRejectsInvalidRequest(t *testing.T) {
+	userID := uuid.MustParse("de498973-c030-4fc2-b075-4b5dbb421002")
+	sandboxID := "44444444-4444-4444-8444-444444444444"
+	tests := []struct {
+		name      string
+		sandboxID string
+		body      string
+	}{
+		{name: "sandbox uuid", sandboxID: "not-a-uuid"},
+		{name: "body", sandboxID: sandboxID, body: `{"status":"stopped"}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler := NewSandboxes(rejectSandboxStore(t), time.Second).Stop()
+			req, rec := stopSandboxRequest(tt.sandboxID, tt.body)
+			handler.ServeHTTP(rec, withUser(req, userID))
+			assertAPIError(t, rec, http.StatusBadRequest, CodeInvalidRequest, "The supplied request is invalid.")
+		})
+	}
+}
+
+func TestStopSandboxMapsErrors(t *testing.T) {
+	userID := uuid.MustParse("de498973-c030-4fc2-b075-4b5dbb421002")
+	sandboxID := "44444444-4444-4444-8444-444444444444"
+	tests := []struct {
+		name    string
+		err     error
+		status  int
+		code    Code
+		message string
+	}{
+		{
+			name:    "not found",
+			err:     sandboxes.ErrNotFound,
+			status:  http.StatusNotFound,
+			code:    CodeNotFound,
+			message: "The requested resource was not found.",
+		},
+		{
+			name:    "unavailable",
+			err:     context.DeadlineExceeded,
+			status:  http.StatusServiceUnavailable,
+			code:    CodeServiceUnavailable,
+			message: "A required service is unavailable.",
+		},
+		{
+			name:    "failed update",
+			err:     errors.New("update failed"),
+			status:  http.StatusInternalServerError,
+			code:    CodeInternalError,
+			message: "The request could not be completed.",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler := NewSandboxes(fakeSandboxStore{
+				stopFn: func(context.Context, uuid.UUID, uuid.UUID) error {
+					return tt.err
+				},
+			}, time.Second).Stop()
+			req, rec := stopSandboxRequest(sandboxID, "")
+			handler.ServeHTTP(rec, withUser(req, userID))
+			assertAPIError(t, rec, tt.status, tt.code, tt.message)
+		})
+	}
+}
+
+func TestStopSandboxRequiresPrincipal(t *testing.T) {
+	handler := NewSandboxes(rejectSandboxStore(t), time.Second).Stop()
+	req, rec := stopSandboxRequest("44444444-4444-4444-8444-444444444444", "")
+	handler.ServeHTTP(rec, req)
+	assertAPIError(t, rec, http.StatusInternalServerError, CodeInternalError, "The request could not be completed.")
+}
+
 func TestListSandboxesRequiresPrincipal(t *testing.T) {
 	handler := NewSandboxes(rejectSandboxStore(t), time.Second).List()
 	req, rec := listSandboxRequest("22222222-2222-4222-8222-222222222222", "", "")
 	handler.ServeHTTP(rec, req)
 	assertAPIError(t, rec, http.StatusInternalServerError, CodeInternalError, "The request could not be completed.")
+}
+
+func stopSandboxRequest(sandboxID, body string) (*http.Request, *httptest.ResponseRecorder) {
+	req, rec := bodyRequest(http.MethodDelete, "/v1/sandboxes/"+sandboxID, "", body)
+	req.SetPathValue("sandboxID", sandboxID)
+	return req, rec
 }
 
 func sandboxRequest(projectID, contentType, body string) (*http.Request, *httptest.ResponseRecorder) {
@@ -379,6 +488,7 @@ func listSandboxRequest(projectID, rawQuery, body string) (*http.Request, *httpt
 type fakeSandboxStore struct {
 	createFn func(context.Context, uuid.UUID, uuid.UUID) (db.Sandbox, error)
 	listFn   func(context.Context, uuid.UUID, uuid.UUID, sandboxes.Page) ([]db.Sandbox, error)
+	stopFn   func(context.Context, uuid.UUID, uuid.UUID) error
 }
 
 func (f fakeSandboxStore) Create(ctx context.Context, userID, projectID uuid.UUID) (db.Sandbox, error) {
@@ -387,6 +497,10 @@ func (f fakeSandboxStore) Create(ctx context.Context, userID, projectID uuid.UUI
 
 func (f fakeSandboxStore) List(ctx context.Context, userID, projectID uuid.UUID, page sandboxes.Page) ([]db.Sandbox, error) {
 	return f.listFn(ctx, userID, projectID, page)
+}
+
+func (f fakeSandboxStore) Stop(ctx context.Context, userID, sandboxID uuid.UUID) error {
+	return f.stopFn(ctx, userID, sandboxID)
 }
 
 func rejectSandboxStore(t *testing.T) fakeSandboxStore {
@@ -401,6 +515,11 @@ func rejectSandboxStore(t *testing.T) fakeSandboxStore {
 			t.Helper()
 			t.Fatal("list called")
 			return nil, nil
+		},
+		stopFn: func(context.Context, uuid.UUID, uuid.UUID) error {
+			t.Helper()
+			t.Fatal("stop called")
+			return nil
 		},
 	}
 }

@@ -1,4 +1,5 @@
-// Package sandboxes creates running sandboxes and lists project sandbox records.
+// Package sandboxes creates running sandboxes, lists project sandbox records,
+// and stops authorized sandboxes.
 package sandboxes
 
 import (
@@ -54,7 +55,7 @@ type Page struct {
 	After *Position
 }
 
-// Service creates and lists sandboxes for authorized project members.
+// Service creates, lists, and stops sandboxes for authorized project members.
 type Service struct {
 	pool    *pgxpool.Pool
 	queries *db.Queries
@@ -137,6 +138,30 @@ func (s *Service) List(ctx context.Context, userID, projectID uuid.UUID, page Pa
 		CursorCreatedAt: page.After.CreatedAt,
 		CursorID:        page.After.ID,
 		RowLimit:        page.Limit,
+	})
+}
+
+// Stop transitions an authorized sandbox from running to stopped.
+// The project id comes from the persisted sandbox. Membership is confirmed
+// again while that project row is locked, in the same order as creation.
+// A row that is already stopped commits unchanged, so the original stopped_at
+// stays and no extra capacity is released. Termination does not call Redis
+// and does not adjust a separate quota counter. Occupancy is the committed
+// count of running rows. A failed commit leaves that count unchanged.
+func (s *Service) Stop(ctx context.Context, userID, sandboxID uuid.UUID) error {
+	sandbox, err := s.queries.GetAuthorizedSandbox(ctx, db.GetAuthorizedSandboxParams{
+		SandboxID: sandboxID,
+		UserID:    userID,
+	})
+	if err != nil {
+		return absent(err)
+	}
+	return s.withLockedProject(ctx, sandbox.ProjectID, userID, func(ctx context.Context, q *db.Queries, locked db.Project) error {
+		_, err := q.StopRunningSandbox(ctx, db.StopRunningSandboxParams{
+			ID:        sandbox.ID,
+			ProjectID: locked.ID,
+		})
+		return err
 	})
 }
 
