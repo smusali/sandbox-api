@@ -20,8 +20,8 @@ type Config struct {
 	OAuthClientSecret          string
 	OAuthRedirectURI           string
 	OAuthAudience              string
-	DefaultMaxRunningSandboxes int
-	DefaultCreationRateLimit   int
+	DefaultMaxRunningSandboxes int32
+	DefaultCreationRateLimit   int32
 	RateLimitWindow            time.Duration
 	OAuthStateTTL              time.Duration
 	RequestTimeout             time.Duration
@@ -108,8 +108,8 @@ func load(getenv func(string) string) (Config, error) {
 		}
 	}
 
-	cfg.DefaultMaxRunningSandboxes = positiveInt(required("DEFAULT_MAX_RUNNING_SANDBOXES"), "DEFAULT_MAX_RUNNING_SANDBOXES", &problems)
-	cfg.DefaultCreationRateLimit = positiveInt(required("DEFAULT_CREATION_RATE_LIMIT"), "DEFAULT_CREATION_RATE_LIMIT", &problems)
+	cfg.DefaultMaxRunningSandboxes = positiveInt32(required("DEFAULT_MAX_RUNNING_SANDBOXES"), "DEFAULT_MAX_RUNNING_SANDBOXES", &problems)
+	cfg.DefaultCreationRateLimit = positiveInt32(required("DEFAULT_CREATION_RATE_LIMIT"), "DEFAULT_CREATION_RATE_LIMIT", &problems)
 	cfg.RateLimitWindow = positiveDuration(required("RATE_LIMIT_WINDOW"), "RATE_LIMIT_WINDOW", &problems)
 	cfg.OAuthStateTTL = positiveDuration(required("OAUTH_STATE_TTL"), "OAUTH_STATE_TTL", &problems)
 	cfg.RequestTimeout = positiveDuration(required("REQUEST_TIMEOUT"), "REQUEST_TIMEOUT", &problems)
@@ -213,16 +213,18 @@ func validateAudience(raw, clientID string) string {
 	return ""
 }
 
-func positiveInt(raw, name string, problems *[]Problem) int {
+// positiveInt32 accepts a base-10 integer that fits in a PostgreSQL INTEGER.
+func positiveInt32(raw, name string, problems *[]Problem) int32 {
 	if raw == "" {
 		return 0
 	}
-	number, err := strconv.Atoi(raw)
+	number, err := strconv.ParseInt(raw, 10, 32)
 	if err != nil || number <= 0 {
 		*problems = append(*problems, Problem{Name: name, Detail: "must be a positive integer"})
 		return 0
 	}
-	return number
+	// ParseInt reports the range-checked value as int64.
+	return int32(number)
 }
 
 func positiveDuration(raw, name string, problems *[]Problem) time.Duration {

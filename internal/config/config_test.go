@@ -55,6 +55,7 @@ func TestLoadRejectsInvalidFields(t *testing.T) {
 		{name: "audience space", key: "OAUTH_AUDIENCE", value: "urn:e2b: sandbox", want: "must not contain whitespace"},
 		{name: "audience client id", key: "OAUTH_AUDIENCE", value: "e2b-assignment", want: "must be distinct from the OAuth client id"},
 		{name: "quota", key: "DEFAULT_MAX_RUNNING_SANDBOXES", value: "0", want: "must be a positive integer"},
+		{name: "quota overflow", key: "DEFAULT_MAX_RUNNING_SANDBOXES", value: "2147483648", want: "must be a positive integer"},
 		{name: "rate limit", key: "DEFAULT_CREATION_RATE_LIMIT", value: "-1", want: "must be a positive integer"},
 		{name: "window", key: "RATE_LIMIT_WINDOW", value: "0s", want: "must be a positive duration"},
 		{name: "state ttl", key: "OAUTH_STATE_TTL", value: "5", want: "must be a positive duration"},
@@ -74,6 +75,20 @@ func TestLoadRejectsInvalidFields(t *testing.T) {
 				t.Fatalf("problems = %#v", invalid.Problems)
 			}
 		})
+	}
+}
+
+func TestLoadAcceptsLargestProjectLimit(t *testing.T) {
+	env := validEnv()
+	env["DEFAULT_MAX_RUNNING_SANDBOXES"] = "2147483647"
+	env["DEFAULT_CREATION_RATE_LIMIT"] = "2147483647"
+
+	cfg, err := load(envGetter(env))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.DefaultMaxRunningSandboxes != 2147483647 || cfg.DefaultCreationRateLimit != 2147483647 {
+		t.Fatalf("limits = %d, %d", cfg.DefaultMaxRunningSandboxes, cfg.DefaultCreationRateLimit)
 	}
 }
 

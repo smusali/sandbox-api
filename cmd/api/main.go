@@ -19,6 +19,7 @@ import (
 	sqldb "github.com/smusali/sandbox-api/internal/db/sqlc"
 	"github.com/smusali/sandbox-api/internal/httpapi"
 	"github.com/smusali/sandbox-api/internal/oauth"
+	"github.com/smusali/sandbox-api/internal/projects"
 )
 
 // idleTimeout bounds how long an idle keep-alive connection stays open.
@@ -78,11 +79,18 @@ func run() error {
 		queries,
 	)
 
+	projectAPI := httpapi.NewProjects(projects.New(pool, queries, projects.Limits{
+		MaxRunningSandboxes: cfg.DefaultMaxRunningSandboxes,
+		CreationRateLimit:   cfg.DefaultCreationRateLimit,
+	}, cfg.RequestTimeout), cfg.RequestTimeout)
+
 	server := &http.Server{
 		Addr: cfg.HTTPAddr,
 		Handler: httpapi.NewRouter(httpapi.Authenticate(verifier, queries, cfg.RequestTimeout), httpapi.Routes{
-			Login:    flow.Login(),
-			Callback: flow.Callback(),
+			Login:         flow.Login(),
+			Callback:      flow.Callback(),
+			CreateProject: projectAPI.Create(),
+			ListProjects:  projectAPI.List(),
 		}),
 		ReadHeaderTimeout: cfg.RequestTimeout,
 		ReadTimeout:       cfg.RequestTimeout,
