@@ -5,7 +5,6 @@ package sandboxes
 import (
 	"context"
 	"errors"
-	"log"
 	"time"
 
 	"github.com/google/uuid"
@@ -13,12 +12,10 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/smusali/sandbox-api/internal/db/sqlc"
+	"github.com/smusali/sandbox-api/internal/postgres"
+	"github.com/smusali/sandbox-api/internal/projects"
 	"github.com/smusali/sandbox-api/internal/ratelimit"
 )
-
-// ErrNotFound means the project is missing or the user is not a member.
-// Callers must treat every cause as the same result.
-var ErrNotFound = errors.New("not found")
 
 // ErrQuotaExceeded means the locked project is already at its running sandbox limit.
 var ErrQuotaExceeded = errors.New("running sandbox quota exceeded")
@@ -33,44 +30,25 @@ func (e *RateLimitedError) Error() string {
 	return "sandbox creation rate limit exceeded"
 }
 
-// admitter counts one creation attempt for a project.
-// An admitted attempt is not returned after quota or persistence failure.
-type admitter interface {
-	Allow(ctx context.Context, projectID uuid.UUID, limit int32) (ratelimit.Decision, error)
-}
-
-var _ admitter = (*ratelimit.Limiter)(nil)
-
-// Position is the creation time and id a later page continues after.
-type Position struct {
-	CreatedAt time.Time
-	ID        uuid.UUID
-}
-
-// Page is one sandbox list read.
-// Limit is the number of rows to read.
-// A nil After starts at the newest sandbox.
-type Page struct {
-	Limit int32
-	After *Position
-}
-
 // Service creates, lists, and stops sandboxes for authorized project members.
 type Service struct {
-	pool    *pgxpool.Pool
-	queries *db.Queries
-	admit   admitter
-	timeout time.Duration
+	pool     *pgxpool.Pool
+	queries  *db.Queries
+	projects *projects.Service
+	admit    *ratelimit.Limiter
+	timeout  time.Duration
 }
 
 // New returns a service that admits creation attempts through admit.
+// projects authorizes the caller before admission or listing.
 // timeout bounds the rollback used when a request context is already canceled.
-func New(pool *pgxpool.Pool, queries *db.Queries, admit admitter, timeout time.Duration) *Service {
+func New(pool *pgxpool.Pool, queries *db.Queries, projects *projects.Service, admit *ratelimit.Limiter, timeout time.Duration) *Service {
 	return &Service{
-		pool:    pool,
-		queries: queries,
-		admit:   admit,
-		timeout: timeout,
+		pool:     pool,
+		queries:  queries,
+		projects: projects,
+		admit:    admit,
+		timeout:  timeout,
 	}
 }
 
@@ -82,12 +60,9 @@ func New(pool *pgxpool.Pool, queries *db.Queries, admit admitter, timeout time.D
 // a different sandbox. An admitted rate unit stays consumed when quota or
 // persistence fails.
 func (s *Service) Create(ctx context.Context, userID, projectID uuid.UUID) (db.Sandbox, error) {
-	project, err := s.queries.GetAuthorizedProject(ctx, db.GetAuthorizedProjectParams{
-		ProjectID: projectID,
-		UserID:    userID,
-	})
+	project, err := s.projects.GetAuthorizedProject(ctx, projectID, userID)
 	if err != nil {
-		return db.Sandbox{}, absent(err)
+		return db.Sandbox{}, err
 	}
 
 	decision, err := s.admit.Allow(ctx, project.ID, project.CreationRateLimit)
@@ -120,12 +95,9 @@ func (s *Service) Create(ctx context.Context, userID, projectID uuid.UUID) (db.S
 // The caller must be a member. Running and stopped rows are included.
 // page.Limit is the number of rows to read. A nil page.After starts at the newest sandbox.
 // Listing does not consume creation allowance and does not lock the project.
-func (s *Service) List(ctx context.Context, userID, projectID uuid.UUID, page Page) ([]db.Sandbox, error) {
-	if _, err := s.queries.GetAuthorizedProject(ctx, db.GetAuthorizedProjectParams{
-		ProjectID: projectID,
-		UserID:    userID,
-	}); err != nil {
-		return nil, absent(err)
+func (s *Service) List(ctx context.Context, userID, projectID uuid.UUID, page postgres.Page) ([]db.Sandbox, error) {
+	if _, err := s.projects.GetAuthorizedProject(ctx, projectID, userID); err != nil {
+		return nil, err
 	}
 	if page.After == nil {
 		return s.queries.ListProjectSandboxes(ctx, db.ListProjectSandboxesParams{
@@ -149,12 +121,9 @@ func (s *Service) List(ctx context.Context, userID, projectID uuid.UUID, page Pa
 // and does not adjust a separate quota counter. Occupancy is the committed
 // count of running rows. A failed commit leaves that count unchanged.
 func (s *Service) Stop(ctx context.Context, userID, sandboxID uuid.UUID) error {
-	sandbox, err := s.queries.GetAuthorizedSandbox(ctx, db.GetAuthorizedSandboxParams{
-		SandboxID: sandboxID,
-		UserID:    userID,
-	})
+	sandbox, err := s.projects.GetAuthorizedSandbox(ctx, sandboxID, userID)
 	if err != nil {
-		return absent(err)
+		return err
 	}
 	return s.withLockedProject(ctx, sandbox.ProjectID, userID, func(ctx context.Context, q *db.Queries, locked db.Project) error {
 		_, err := q.StopRunningSandbox(ctx, db.StopRunningSandboxParams{
@@ -172,7 +141,7 @@ func (s *Service) withLockedProject(ctx context.Context, projectID, userID uuid.
 	if err != nil {
 		return err
 	}
-	defer s.rollback(tx)
+	defer postgres.Rollback(tx, s.timeout)
 
 	bound := s.queries.WithTx(tx)
 	locked, err := bound.LockAuthorizedProject(ctx, db.LockAuthorizedProjectParams{
@@ -180,7 +149,7 @@ func (s *Service) withLockedProject(ctx context.Context, projectID, userID uuid.
 		UserID:    userID,
 	})
 	if err != nil {
-		return absent(err)
+		return postgres.Absent(err)
 	}
 	if err := fn(ctx, bound, locked); err != nil {
 		return err
@@ -199,21 +168,4 @@ func quotaFull(running int64, limit int32) bool {
 
 func runningCapacity(limit int32) int64 {
 	return int64(limit)
-}
-
-func absent(err error) error {
-	if errors.Is(err, pgx.ErrNoRows) {
-		return ErrNotFound
-	}
-	return err
-}
-
-func (s *Service) rollback(tx pgx.Tx) {
-	rollbackCtx, cancel := context.WithTimeout(context.Background(), s.timeout)
-	defer cancel()
-	err := tx.Rollback(rollbackCtx)
-	if err == nil || errors.Is(err, pgx.ErrTxClosed) {
-		return
-	}
-	log.Printf("internal error: %v", err)
 }

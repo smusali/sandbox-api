@@ -4,7 +4,6 @@ package projects
 import (
 	"context"
 	"errors"
-	"log"
 	"time"
 
 	"github.com/google/uuid"
@@ -12,11 +11,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/smusali/sandbox-api/internal/db/sqlc"
+	"github.com/smusali/sandbox-api/internal/postgres"
 )
-
-// ErrNotFound means the project, sandbox, or user is missing or inaccessible.
-// Callers must treat every cause as the same result.
-var ErrNotFound = errors.New("not found")
 
 // errMembershipMissing is an insert conflict whose membership row cannot be read.
 var errMembershipMissing = errors.New("membership row missing after insert conflict")
@@ -25,20 +21,6 @@ var errMembershipMissing = errors.New("membership row missing after insert confl
 type Limits struct {
 	MaxRunningSandboxes int32
 	CreationRateLimit   int32
-}
-
-// Position is the creation time and id a later page continues after.
-type Position struct {
-	CreatedAt time.Time
-	ID        uuid.UUID
-}
-
-// Page is one membership list read.
-// Limit is the number of rows to read.
-// A nil After starts at the newest project.
-type Page struct {
-	Limit int32
-	After *Position
 }
 
 // Member is one project membership.
@@ -76,7 +58,7 @@ func (s *Service) Create(ctx context.Context, userID uuid.UUID, name string) (db
 	if err != nil {
 		return db.Project{}, err
 	}
-	defer s.rollback(tx)
+	defer postgres.Rollback(tx, s.timeout)
 
 	bound := s.queries.WithTx(tx)
 	project, err := bound.CreateProject(ctx, db.CreateProjectParams{
@@ -102,7 +84,7 @@ func (s *Service) Create(ctx context.Context, userID uuid.UUID, name string) (db
 
 // List returns the user's projects, newest first.
 // page.Limit is the number of rows to read. A nil page.After starts at the newest project.
-func (s *Service) List(ctx context.Context, userID uuid.UUID, page Page) ([]db.Project, error) {
+func (s *Service) List(ctx context.Context, userID uuid.UUID, page postgres.Page) ([]db.Project, error) {
 	if page.After == nil {
 		return s.queries.ListUserProjects(ctx, db.ListUserProjectsParams{
 			UserID:   userID,
@@ -118,7 +100,7 @@ func (s *Service) List(ctx context.Context, userID uuid.UUID, page Page) ([]db.P
 }
 
 // GetAuthorizedProject returns the project when userID is a member.
-// A missing project and a project without that membership both return ErrNotFound.
+// A missing project and a project without that membership both return postgres.ErrNotFound.
 // The result includes the project's persisted sandbox limits.
 func (s *Service) GetAuthorizedProject(ctx context.Context, projectID, userID uuid.UUID) (db.Project, error) {
 	project, err := s.queries.GetAuthorizedProject(ctx, db.GetAuthorizedProjectParams{
@@ -126,21 +108,21 @@ func (s *Service) GetAuthorizedProject(ctx context.Context, projectID, userID uu
 		UserID:    userID,
 	})
 	if err != nil {
-		return db.Project{}, absent(err)
+		return db.Project{}, postgres.Absent(err)
 	}
 	return project, nil
 }
 
 // GetAuthorizedSandbox returns the sandbox when userID belongs to its stored project.
 // The sandbox id is the only resource identifier. A missing sandbox and a sandbox
-// in another project both return ErrNotFound.
+// in another project both return postgres.ErrNotFound.
 func (s *Service) GetAuthorizedSandbox(ctx context.Context, sandboxID, userID uuid.UUID) (db.Sandbox, error) {
 	sandbox, err := s.queries.GetAuthorizedSandbox(ctx, db.GetAuthorizedSandboxParams{
 		SandboxID: sandboxID,
 		UserID:    userID,
 	})
 	if err != nil {
-		return db.Sandbox{}, absent(err)
+		return db.Sandbox{}, postgres.Absent(err)
 	}
 	return sandbox, nil
 }
@@ -153,17 +135,17 @@ func (s *Service) AddMember(ctx context.Context, actorID, projectID, userID uuid
 	if err != nil {
 		return Member{}, err
 	}
-	defer s.rollback(tx)
+	defer postgres.Rollback(tx, s.timeout)
 
 	bound := s.queries.WithTx(tx)
 	if _, err := bound.GetAuthorizedProject(ctx, db.GetAuthorizedProjectParams{
 		ProjectID: projectID,
 		UserID:    actorID,
 	}); err != nil {
-		return Member{}, absent(err)
+		return Member{}, postgres.Absent(err)
 	}
 	if _, err := bound.GetUserByID(ctx, userID); err != nil {
-		return Member{}, absent(err)
+		return Member{}, postgres.Absent(err)
 	}
 
 	inserted, err := bound.AddProjectMember(ctx, db.AddProjectMemberParams{
@@ -203,21 +185,4 @@ func memberFrom(row db.ProjectMember, created bool) Member {
 		CreatedAt: row.CreatedAt,
 		Created:   created,
 	}
-}
-
-func absent(err error) error {
-	if errors.Is(err, pgx.ErrNoRows) {
-		return ErrNotFound
-	}
-	return err
-}
-
-func (s *Service) rollback(tx pgx.Tx) {
-	rollbackCtx, cancel := context.WithTimeout(context.Background(), s.timeout)
-	defer cancel()
-	err := tx.Rollback(rollbackCtx)
-	if err == nil || errors.Is(err, pgx.ErrTxClosed) {
-		return
-	}
-	log.Printf("internal error: %v", err)
 }

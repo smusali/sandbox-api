@@ -3,7 +3,6 @@ package db
 import (
 	"context"
 	"errors"
-	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -63,47 +62,14 @@ func TestSchema(t *testing.T) {
 
 func newSchemaDB(t *testing.T) *pgxpool.Pool {
 	t.Helper()
-	ctx := context.Background()
-	adminURL := os.Getenv("DATABASE_URL")
-	if adminURL == "" {
-		adminURL = "postgres://e2b:e2b@localhost:5432/e2b"
-	}
-
-	admin, err := pgxpool.New(ctx, adminURL)
+	pool, cleanup, err := OpenIsolated(context.Background(), os.Getenv("DATABASE_URL"))
 	if err != nil {
-		t.Skipf("postgres unreachable: %v", err)
+		if errors.Is(err, ErrUnreachable) {
+			t.Skipf("postgres unreachable: %v", err)
+		}
+		t.Fatalf("OpenIsolated() error = %v", err)
 	}
-	t.Cleanup(admin.Close)
-
-	pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	if err := admin.Ping(pingCtx); err != nil {
-		t.Skipf("postgres unreachable: %v", err)
-	}
-
-	name := "sandbox_api_" + strings.ReplaceAll(uuid.New().String(), "-", "")
-	ident := pgx.Identifier{name}.Sanitize()
-	if _, err := admin.Exec(ctx, "CREATE DATABASE "+ident); err != nil {
-		t.Fatalf("create database: %v", err)
-	}
-	t.Cleanup(func() {
-		_, _ = admin.Exec(context.Background(), "DROP DATABASE "+ident+" WITH (FORCE)")
-	})
-
-	parsed, err := url.Parse(adminURL)
-	if err != nil {
-		t.Fatalf("parse database url: %v", err)
-	}
-	parsed.Path = "/" + name
-	pool, err := pgxpool.New(ctx, parsed.String())
-	if err != nil {
-		t.Fatalf("open database: %v", err)
-	}
-	t.Cleanup(pool.Close)
-
-	if err := Up(ctx, pool); err != nil {
-		t.Fatalf("Up() error = %v", err)
-	}
+	t.Cleanup(cleanup)
 	return pool
 }
 

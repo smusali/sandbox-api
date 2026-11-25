@@ -1,5 +1,5 @@
-// Package postgres classifies database failures that mean the request
-// cannot be completed.
+// Package postgres classifies database failures, rolls a transaction back,
+// and carries the keyset page passed to list queries.
 package postgres
 
 import (

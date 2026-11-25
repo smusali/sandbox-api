@@ -9,29 +9,19 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/smusali/sandbox-api/internal/auth"
-	"github.com/smusali/sandbox-api/internal/db/sqlc"
-	"github.com/smusali/sandbox-api/internal/postgres"
 	"github.com/smusali/sandbox-api/internal/projects"
 )
-
-type projectStore interface {
-	Create(ctx context.Context, userID uuid.UUID, name string) (db.Project, error)
-	List(ctx context.Context, userID uuid.UUID, page projects.Page) ([]db.Project, error)
-	AddMember(ctx context.Context, actorID, projectID, userID uuid.UUID) (projects.Member, error)
-}
-
-var _ projectStore = (*projects.Service)(nil)
 
 var errMissingPrincipal = errors.New("authenticated user is missing")
 
 // Projects serves project creation, discovery, and membership.
 type Projects struct {
-	store   projectStore
+	store   *projects.Service
 	timeout time.Duration
 }
 
 // NewProjects binds project persistence to the HTTP handlers.
-func NewProjects(store projectStore, timeout time.Duration) *Projects {
+func NewProjects(store *projects.Service, timeout time.Duration) *Projects {
 	return &Projects{store: store, timeout: timeout}
 }
 
@@ -93,26 +83,23 @@ func (p *Projects) list(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), p.timeout)
 	defer cancel()
-	rows, err := p.store.List(ctx, userID, listPage(span))
+	rows, err := p.store.List(ctx, userID, queryPage(span))
 	if err != nil {
-		WriteError(w, persistenceFailure(err))
+		WriteError(w, resourceFailure(err))
 		return
 	}
-	count, more := Trim(len(rows), page.Limit)
-	items := make([]Project, 0, count)
-	for _, row := range rows[:count] {
+	end, err := endPage(CollectionProjects, NewID(userID), len(rows), page.Limit, func(i int) (time.Time, ID) {
+		return rows[i].CreatedAt, NewID(rows[i].ID)
+	})
+	if err != nil {
+		WriteError(w, err)
+		return
+	}
+	items := make([]Project, 0, end.count)
+	for _, row := range rows[:end.count] {
 		items = append(items, NewProject(NewID(row.ID), row.Name, row.CreatedAt))
 	}
-	var next *string
-	if more {
-		last := rows[count-1]
-		next, err = NextCursor(CollectionProjects, NewID(userID), last.CreatedAt, NewID(last.ID), true)
-		if err != nil {
-			WriteError(w, err)
-			return
-		}
-	}
-	WriteProjectPage(w, http.StatusOK, NewProjectPage(items, next))
+	WriteProjectPage(w, http.StatusOK, NewProjectPage(items, end.next))
 }
 
 func (p *Projects) addMember(w http.ResponseWriter, r *http.Request) {
@@ -135,7 +122,7 @@ func (p *Projects) addMember(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	member, err := p.store.AddMember(ctx, actorID, projectID.UUID(), req.UserID.UUID())
 	if err != nil {
-		WriteError(w, membershipFailure(err))
+		WriteError(w, resourceFailure(err))
 		return
 	}
 	status := http.StatusOK
@@ -151,28 +138,4 @@ func principalUser(r *http.Request) (uuid.UUID, error) {
 		return uuid.Nil, errMissingPrincipal
 	}
 	return principal.UserID, nil
-}
-
-func listPage(span Span) projects.Page {
-	page := projects.Page{Limit: span.Limit()}
-	if !span.HasAfter() {
-		return page
-	}
-	after := span.After()
-	page.After = &projects.Position{CreatedAt: after.CreatedAt(), ID: after.ID()}
-	return page
-}
-
-func persistenceFailure(err error) error {
-	if postgres.Unavailable(err) {
-		return ServiceUnavailable()
-	}
-	return err
-}
-
-func membershipFailure(err error) error {
-	if errors.Is(err, projects.ErrNotFound) {
-		return NotFound()
-	}
-	return persistenceFailure(err)
 }

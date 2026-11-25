@@ -6,21 +6,22 @@ package oauth
 import (
 	"context"
 	"errors"
-	"net/http"
 	"net/url"
 	"time"
 
+	"github.com/google/uuid"
 	"golang.org/x/oauth2"
 
 	"github.com/smusali/sandbox-api/internal/auth"
 	"github.com/smusali/sandbox-api/internal/db/sqlc"
-	"github.com/smusali/sandbox-api/internal/httpapi"
 	"github.com/smusali/sandbox-api/internal/postgres"
 )
 
 const (
-	bindingCookie     = "sandbox_oauth_binding"
-	bindingCookiePath = "/auth/callback"
+	// BindingCookieName is the browser binding cookie written by login.
+	BindingCookieName = "sandbox_oauth_binding"
+	// BindingCookiePath limits that cookie to the callback.
+	BindingCookiePath = "/auth/callback"
 
 	stateSaveAttempts = 3
 
@@ -30,21 +31,44 @@ const (
 
 var hydraScopes = []string{"openid", "offline"}
 
-type stateStore interface {
-	Save(ctx context.Context, state string, record transaction, ttl time.Duration) error
-	Consume(ctx context.Context, state, bindingHash string) (string, error)
+// Kind classifies a login or callback failure for the HTTP layer.
+type Kind int
+
+const (
+	// KindState means the OAuth state is missing, incorrect, expired, or consumed.
+	KindState Kind = iota + 1
+	// KindAuthorization means Hydra rejected the authorization code or consent.
+	KindAuthorization
+	// KindProvider means the upstream token response was invalid.
+	KindProvider
+	// KindUnavailable means a required dependency could not complete the flow.
+	KindUnavailable
+	// KindInternal means the flow failed for an unexpected reason.
+	KindInternal
+)
+
+// Error is one authorization-code failure.
+type Error struct {
+	Kind       Kind
+	KeepCookie bool
 }
 
-type exchanger interface {
-	Exchange(ctx context.Context, code, verifier string) (accessToken, error)
-}
-
-type identityVerifier interface {
-	Verify(ctx context.Context, raw string) (auth.Identity, error)
-}
-
-type userStore interface {
-	UpsertUser(ctx context.Context, arg db.UpsertUserParams) (db.User, error)
+func (e *Error) Error() string {
+	if e == nil {
+		return "oauth failed"
+	}
+	switch e.Kind {
+	case KindState:
+		return "oauth state rejected"
+	case KindAuthorization:
+		return "oauth authorization failed"
+	case KindProvider:
+		return "oauth provider error"
+	case KindUnavailable:
+		return "oauth dependency unavailable"
+	default:
+		return "oauth failed"
+	}
 }
 
 // Settings is the OAuth client used for login and the token exchange.
@@ -59,33 +83,37 @@ type Settings struct {
 	Timeout      time.Duration
 }
 
-// Flow serves the authorization-code login and callback.
+// Login is a stored authorization transaction and the redirect that starts it.
+type Login struct {
+	Location string
+	Binding  string
+	Secure   bool
+	MaxAge   int
+}
+
+// Session is a completed callback.
+// ExpiresIn is nil when the provider omitted the lifetime.
+type Session struct {
+	AccessToken string
+	ExpiresIn   *int
+	UserID      uuid.UUID
+}
+
+// Flow runs the authorization-code login and callback.
 type Flow struct {
 	stateTTL     time.Duration
 	timeout      time.Duration
 	secureCookie bool
 	audience     string
 	oauth        *oauth2.Config
-	states       stateStore
-	tokens       exchanger
-	verifier     identityVerifier
-	users        userStore
+	states       *RedisStore
+	tokens       *Exchanger
+	verifier     *auth.Verifier
+	users        *db.Queries
 }
 
-type failure struct {
-	public     *httpapi.Error
-	keepCookie bool
-}
-
-func (f *failure) Error() string {
-	if f == nil || f.public == nil {
-		return "oauth failed"
-	}
-	return f.public.Error()
-}
-
-// New builds the login and callback handlers.
-func New(settings Settings, states stateStore, tokens exchanger, verifier identityVerifier, users userStore) *Flow {
+// New builds a flow that stores transactions in states and users in users.
+func New(settings Settings, states *RedisStore, tokens *Exchanger, verifier *auth.Verifier, users *db.Queries) *Flow {
 	return &Flow{
 		stateTTL:     settings.StateTTL,
 		timeout:      settings.Timeout,
@@ -107,25 +135,20 @@ func New(settings Settings, states stateStore, tokens exchanger, verifier identi
 	}
 }
 
-// Login starts an authorization-code request.
-func (f *Flow) Login() http.Handler {
-	return http.HandlerFunc(f.login)
+// SecureCookie reports whether the binding cookie requires HTTPS.
+func (f *Flow) SecureCookie() bool {
+	return f.secureCookie
 }
 
-// Callback completes an authorization-code request.
-func (f *Flow) Callback() http.Handler {
-	return http.HandlerFunc(f.callback)
-}
-
-func (f *Flow) login(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), f.timeout)
+// Begin stores a login transaction and returns the Hydra redirect.
+func (f *Flow) Begin(ctx context.Context) (Login, error) {
+	ctx, cancel := context.WithTimeout(ctx, f.timeout)
 	defer cancel()
 
 	verifier := oauth2.GenerateVerifier()
 	binding, err := randomSecret()
 	if err != nil {
-		httpapi.WriteError(w, httpapi.Internal())
-		return
+		return Login{}, &Error{Kind: KindInternal}
 	}
 	record := transaction{
 		BrowserBinding: bindingHash(binding),
@@ -135,67 +158,56 @@ func (f *Flow) login(w http.ResponseWriter, r *http.Request) {
 	for attempt := 0; attempt < stateSaveAttempts; attempt++ {
 		state, err := randomSecret()
 		if err != nil {
-			httpapi.WriteError(w, httpapi.Internal())
-			return
+			return Login{}, &Error{Kind: KindInternal}
 		}
 		err = f.states.Save(ctx, state, record, f.stateTTL)
 		if err == nil {
-			f.setBindingCookie(w, binding)
-			httpapi.NoStore(w)
-			http.Redirect(w, r, f.authorizeURL(state, verifier), http.StatusFound)
-			return
+			return Login{
+				Location: f.authorizeURL(state, verifier),
+				Binding:  binding,
+				Secure:   f.secureCookie,
+				MaxAge:   int(f.stateTTL / time.Second),
+			}, nil
 		}
 		if errors.Is(err, errStateExists) {
 			continue
 		}
-		httpapi.WriteError(w, httpapi.ServiceUnavailable())
-		return
+		return Login{}, &Error{Kind: KindUnavailable}
 	}
-	httpapi.WriteError(w, httpapi.Internal())
+	return Login{}, &Error{Kind: KindInternal}
 }
 
-func (f *Flow) callback(w http.ResponseWriter, r *http.Request) {
-	if err := f.complete(w, r); err != nil {
-		f.writeFailure(w, err)
-	}
-}
-
-func (f *Flow) complete(w http.ResponseWriter, r *http.Request) *failure {
-	ctx, cancel := context.WithTimeout(r.Context(), f.timeout)
+// Finish consumes the login transaction, exchanges the code, and registers the user.
+// binding is the cookie value from the browser that started Begin.
+// providerError is the error query parameter Hydra sent, or empty.
+func (f *Flow) Finish(ctx context.Context, state, binding, code, providerError string) (Session, error) {
+	ctx, cancel := context.WithTimeout(ctx, f.timeout)
 	defer cancel()
 
-	query := r.URL.Query()
-	state := query.Get("state")
-	if !validSecret(state) {
-		return stateRejected()
+	if !validSecret(state) || !validSecret(binding) {
+		return Session{}, &Error{Kind: KindState}
 	}
-	cookie, err := r.Cookie(bindingCookie)
-	if err != nil || cookie == nil || !validSecret(cookie.Value) {
-		return stateRejected()
-	}
-
-	verifier, err := f.states.Consume(ctx, state, bindingHash(cookie.Value))
+	verifier, err := f.states.Consume(ctx, state, bindingHash(binding))
 	if err != nil {
-		return mapConsume(err)
+		return Session{}, mapConsume(err)
 	}
-	if providerErr := query.Get("error"); providerErr != "" {
-		if providerErr == providerServerError || providerErr == providerTemporary {
-			return dependencyDown(false)
+	if providerError != "" {
+		if providerError == providerServerError || providerError == providerTemporary {
+			return Session{}, &Error{Kind: KindUnavailable}
 		}
-		return authorizationRejected()
+		return Session{}, &Error{Kind: KindAuthorization}
 	}
-	code := query.Get("code")
 	if !validCode(code) {
-		return authorizationRejected()
+		return Session{}, &Error{Kind: KindAuthorization}
 	}
 
 	access, err := f.tokens.Exchange(ctx, code, verifier)
 	if err != nil {
-		return mapExchange(err)
+		return Session{}, mapExchange(err)
 	}
 	identity, err := f.verifier.Verify(ctx, access.Value)
 	if err != nil {
-		return mapVerify(err)
+		return Session{}, mapVerify(err)
 	}
 	user, err := f.users.UpsertUser(ctx, db.UpsertUserParams{
 		OauthIssuer:  identity.Issuer,
@@ -203,13 +215,13 @@ func (f *Flow) complete(w http.ResponseWriter, r *http.Request) *failure {
 		Email:        optionalEmail(identity.Email),
 	})
 	if err != nil {
-		return mapUsers(err)
+		return Session{}, mapUsers(err)
 	}
-
-	f.clearBindingCookie(w)
-	httpapi.NoStore(w)
-	httpapi.WriteToken(w, http.StatusOK, httpapi.NewTokenResponse(access.Value, access.ExpiresIn, httpapi.NewID(user.ID)))
-	return nil
+	return Session{
+		AccessToken: access.Value,
+		ExpiresIn:   access.ExpiresIn,
+		UserID:      user.ID,
+	}, nil
 }
 
 func (f *Flow) authorizeURL(state, verifier string) string {
@@ -220,95 +232,44 @@ func (f *Flow) authorizeURL(state, verifier string) string {
 	)
 }
 
-func (f *Flow) setBindingCookie(w http.ResponseWriter, binding string) {
-	http.SetCookie(w, f.bindingCookie(binding, int(f.stateTTL/time.Second)))
-}
-
-func (f *Flow) clearBindingCookie(w http.ResponseWriter) {
-	http.SetCookie(w, f.bindingCookie("", -1))
-}
-
-func (f *Flow) bindingCookie(value string, maxAge int) *http.Cookie {
-	return &http.Cookie{
-		Name:     bindingCookie,
-		Value:    value,
-		Path:     bindingCookiePath,
-		MaxAge:   maxAge,
-		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
-		Secure:   f.secureCookie,
-	}
-}
-
-func (f *Flow) writeFailure(w http.ResponseWriter, err *failure) {
-	if err == nil || !err.keepCookie {
-		f.clearBindingCookie(w)
-	}
-	if err == nil || err.public == nil {
-		httpapi.WriteError(w, httpapi.Internal())
-		return
-	}
-	httpapi.WriteError(w, err.public)
-}
-
-func stateRejected() *failure {
-	return &failure{public: httpapi.InvalidOAuthState()}
-}
-
-func authorizationRejected() *failure {
-	return &failure{public: httpapi.OAuthAuthorizationFailed()}
-}
-
-func providerRejected() *failure {
-	return &failure{public: httpapi.OAuthProviderError()}
-}
-
-func dependencyDown(keepCookie bool) *failure {
-	return &failure{public: httpapi.ServiceUnavailable(), keepCookie: keepCookie}
-}
-
-func internalFailure() *failure {
-	return &failure{public: httpapi.Internal()}
-}
-
-func mapConsume(err error) *failure {
+func mapConsume(err error) error {
 	switch {
 	case errors.Is(err, errStateMissing), errors.Is(err, errStateMismatch):
-		return stateRejected()
+		return &Error{Kind: KindState}
 	case errors.Is(err, errStateCorrupt), errors.Is(err, errStateReply):
-		return internalFailure()
+		return &Error{Kind: KindInternal}
 	default:
-		return dependencyDown(true)
+		return &Error{Kind: KindUnavailable, KeepCookie: true}
 	}
 }
 
-func mapExchange(err error) *failure {
+func mapExchange(err error) error {
 	switch {
 	case errors.Is(err, errAuthorizationRejected):
-		return authorizationRejected()
+		return &Error{Kind: KindAuthorization}
 	case errors.Is(err, errProviderUnavailable):
-		return dependencyDown(false)
+		return &Error{Kind: KindUnavailable}
 	default:
-		return providerRejected()
+		return &Error{Kind: KindProvider}
 	}
 }
 
-func mapVerify(err error) *failure {
+func mapVerify(err error) error {
 	switch {
 	case errors.Is(err, auth.ErrKeySetUnavailable):
-		return dependencyDown(false)
+		return &Error{Kind: KindUnavailable}
 	case errors.Is(err, auth.ErrInvalidToken):
-		return providerRejected()
+		return &Error{Kind: KindProvider}
 	default:
-		return internalFailure()
+		return &Error{Kind: KindInternal}
 	}
 }
 
-func mapUsers(err error) *failure {
+func mapUsers(err error) error {
 	if postgres.Unavailable(err) {
-		return dependencyDown(false)
+		return &Error{Kind: KindUnavailable}
 	}
-	return internalFailure()
+	return &Error{Kind: KindInternal}
 }
 
 func optionalEmail(email string) *string {

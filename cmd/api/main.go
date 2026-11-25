@@ -24,7 +24,6 @@ import (
 	"github.com/smusali/sandbox-api/internal/sandboxes"
 )
 
-// idleTimeout bounds how long an idle keep-alive connection stays open.
 const idleTimeout = 60 * time.Second
 
 func main() {
@@ -63,62 +62,11 @@ func run() error {
 	defer func() {
 		_ = admissionClient.Close()
 	}()
-	limiter, err := ratelimit.New(admissionClient, cfg.RateLimitWindow)
+	handler, err := newHandler(cfg, pool, redisClient, admissionClient)
 	if err != nil {
 		return err
 	}
-
-	verifier := auth.NewVerifier(
-		cfg.OAuthIssuer,
-		cfg.OAuthAudience,
-		cfg.OAuthClientID,
-		cfg.JWKSEndpoint(),
-		cfg.RequestTimeout,
-	)
-	queries := sqldb.New(pool)
-	flow := oauth.New(
-		oauth.Settings{
-			ClientID:     cfg.OAuthClientID,
-			ClientSecret: cfg.OAuthClientSecret,
-			RedirectURI:  cfg.OAuthRedirectURI,
-			AuthURL:      cfg.AuthorizationEndpoint(),
-			TokenURL:     cfg.TokenEndpoint(),
-			Audience:     cfg.OAuthAudience,
-			StateTTL:     cfg.OAuthStateTTL,
-			Timeout:      cfg.RequestTimeout,
-		},
-		oauth.NewRedisStore(redisClient),
-		oauth.NewExchanger(cfg.OAuthClientID, cfg.OAuthClientSecret, cfg.OAuthRedirectURI, cfg.TokenEndpoint(), cfg.RequestTimeout),
-		verifier,
-		queries,
-	)
-
-	projectAPI := httpapi.NewProjects(projects.New(pool, queries, projects.Limits{
-		MaxRunningSandboxes: cfg.DefaultMaxRunningSandboxes,
-		CreationRateLimit:   cfg.DefaultCreationRateLimit,
-	}, cfg.RequestTimeout), cfg.RequestTimeout)
-	sandboxAPI := httpapi.NewSandboxes(
-		sandboxes.New(pool, queries, limiter, cfg.RequestTimeout),
-		cfg.RequestTimeout,
-	)
-
-	server := &http.Server{
-		Addr: cfg.HTTPAddr,
-		Handler: httpapi.NewRouter(httpapi.Authenticate(verifier, queries, cfg.RequestTimeout), httpapi.Routes{
-			Login:         flow.Login(),
-			Callback:      flow.Callback(),
-			CreateProject: projectAPI.Create(),
-			ListProjects:  projectAPI.List(),
-			AddMember:     projectAPI.AddMember(),
-			CreateSandbox: sandboxAPI.Create(),
-			ListSandboxes: sandboxAPI.List(),
-			StopSandbox:   sandboxAPI.Stop(),
-		}),
-		ReadHeaderTimeout: cfg.RequestTimeout,
-		ReadTimeout:       cfg.RequestTimeout,
-		WriteTimeout:      cfg.RequestTimeout,
-		IdleTimeout:       idleTimeout,
-	}
+	server := newHTTPServer(cfg, handler)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -185,4 +133,66 @@ func openRedis(ctx context.Context, cfg config.Config) (*redis.Client, error) {
 		return nil, fmt.Errorf("ping redis: %w", err)
 	}
 	return client, nil
+}
+
+func newHandler(cfg config.Config, pool *pgxpool.Pool, stateRedis, admission *redis.Client) (http.Handler, error) {
+	limiter, err := ratelimit.New(admission, cfg.RateLimitWindow)
+	if err != nil {
+		return nil, err
+	}
+	verifier := auth.NewVerifier(
+		cfg.OAuthIssuer,
+		cfg.OAuthAudience,
+		cfg.OAuthClientID,
+		cfg.JWKSEndpoint(),
+		cfg.RequestTimeout,
+	)
+	queries := sqldb.New(pool)
+	flow := oauth.New(
+		oauth.Settings{
+			ClientID:     cfg.OAuthClientID,
+			ClientSecret: cfg.OAuthClientSecret,
+			RedirectURI:  cfg.OAuthRedirectURI,
+			AuthURL:      cfg.AuthorizationEndpoint(),
+			TokenURL:     cfg.TokenEndpoint(),
+			Audience:     cfg.OAuthAudience,
+			StateTTL:     cfg.OAuthStateTTL,
+			Timeout:      cfg.RequestTimeout,
+		},
+		oauth.NewRedisStore(stateRedis),
+		oauth.NewExchanger(cfg.OAuthClientID, cfg.OAuthClientSecret, cfg.OAuthRedirectURI, cfg.TokenEndpoint(), cfg.RequestTimeout),
+		verifier,
+		queries,
+	)
+	projectSvc := projects.New(pool, queries, projects.Limits{
+		MaxRunningSandboxes: cfg.DefaultMaxRunningSandboxes,
+		CreationRateLimit:   cfg.DefaultCreationRateLimit,
+	}, cfg.RequestTimeout)
+	projectAPI := httpapi.NewProjects(projectSvc, cfg.RequestTimeout)
+	sandboxAPI := httpapi.NewSandboxes(
+		sandboxes.New(pool, queries, projectSvc, limiter, cfg.RequestTimeout),
+		cfg.RequestTimeout,
+	)
+	oauthAPI := httpapi.NewOAuth(flow)
+	return httpapi.NewRouter(httpapi.Authenticate(verifier, queries, cfg.RequestTimeout), httpapi.Routes{
+		Login:         oauthAPI.Login(),
+		Callback:      oauthAPI.Callback(),
+		CreateProject: projectAPI.Create(),
+		ListProjects:  projectAPI.List(),
+		AddMember:     projectAPI.AddMember(),
+		CreateSandbox: sandboxAPI.Create(),
+		ListSandboxes: sandboxAPI.List(),
+		StopSandbox:   sandboxAPI.Stop(),
+	}), nil
+}
+
+func newHTTPServer(cfg config.Config, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              cfg.HTTPAddr,
+		Handler:           handler,
+		ReadHeaderTimeout: cfg.RequestTimeout,
+		ReadTimeout:       cfg.RequestTimeout,
+		WriteTimeout:      cfg.RequestTimeout,
+		IdleTimeout:       idleTimeout,
+	}
 }

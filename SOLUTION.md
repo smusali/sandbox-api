@@ -1,16 +1,16 @@
 # Solution
 
-This document describes the architecture that is implemented. `CASES.md` is the behavioral contract. `README.md` is the local setup and the reviewer walkthrough. The scalability paths at the end are recorded only. They are not built.
+This document describes the architecture that is implemented. `README.md` is the local setup and the reviewer walkthrough. The scalability paths at the end are recorded only. They are not built.
 
 ## Problem interpretation
 
-Callers authenticate with Hydra, then keep durable records of projects, memberships, and sandbox lifecycle. A sandbox is a row with status `running` or `stopped`. The service answers the eight HTTP operations in `CASES.md`: login, callback, project create, project list, add member, sandbox create, sandbox list, and sandbox stop.
+Callers authenticate with Hydra, then keep durable records of projects, memberships, and sandbox lifecycle. A sandbox is a row with status `running` or `stopped`. The service answers login, callback, project create, project list, add member, sandbox create, sandbox list, and sandbox stop.
 
 PostgreSQL holds users, projects, memberships, sandbox rows, and the running occupancy those rows imply. Redis holds login transactions and the temporary creation allowance. Hydra issues tokens. The API is an OAuth client and a resource server.
 
 ## Scope and assumptions
 
-`CASES.md` fixes the observable contract: project membership as the tenancy boundary, equal permissions for every member, server-generated UUIDs, a persisted running quota of 10 and a persisted creation allowance of 20 on each new project, a 60-second fixed creation window, keyset pagination, `404` for hidden resources, and non-idempotent project and sandbox creation.
+The observable contract is project membership as the tenancy boundary, equal permissions for every member, server-generated UUIDs, a persisted running quota of 10 and a persisted creation allowance of 20 on each new project, a 60-second fixed creation window, keyset pagination, `404` for hidden resources, and non-idempotent project and sandbox creation.
 
 This implementation adds the following choices around that contract:
 

@@ -6,30 +6,19 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/smusali/sandbox-api/internal/db/sqlc"
-	"github.com/smusali/sandbox-api/internal/postgres"
 	"github.com/smusali/sandbox-api/internal/ratelimit"
 	"github.com/smusali/sandbox-api/internal/sandboxes"
 )
 
-type sandboxStore interface {
-	Create(ctx context.Context, userID, projectID uuid.UUID) (db.Sandbox, error)
-	List(ctx context.Context, userID, projectID uuid.UUID, page sandboxes.Page) ([]db.Sandbox, error)
-	Stop(ctx context.Context, userID, sandboxID uuid.UUID) error
-}
-
-var _ sandboxStore = (*sandboxes.Service)(nil)
-
 // Sandboxes serves sandbox creation, listing, and termination.
 type Sandboxes struct {
-	store   sandboxStore
+	store   *sandboxes.Service
 	timeout time.Duration
 }
 
 // NewSandboxes binds sandbox persistence to the HTTP handlers.
-func NewSandboxes(store sandboxStore, timeout time.Duration) *Sandboxes {
+func NewSandboxes(store *sandboxes.Service, timeout time.Duration) *Sandboxes {
 	return &Sandboxes{store: store, timeout: timeout}
 }
 
@@ -100,26 +89,23 @@ func (s *Sandboxes) list(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), s.timeout)
 	defer cancel()
-	rows, err := s.store.List(ctx, userID, projectID.UUID(), sandboxPage(span))
+	rows, err := s.store.List(ctx, userID, projectID.UUID(), queryPage(span))
 	if err != nil {
-		WriteError(w, listFailure(err))
+		WriteError(w, resourceFailure(err))
 		return
 	}
-	count, more := Trim(len(rows), page.Limit)
-	items := make([]Sandbox, 0, count)
-	for _, row := range rows[:count] {
+	end, err := endPage(CollectionSandboxes, projectID, len(rows), page.Limit, func(i int) (time.Time, ID) {
+		return rows[i].CreatedAt, NewID(rows[i].ID)
+	})
+	if err != nil {
+		WriteError(w, err)
+		return
+	}
+	items := make([]Sandbox, 0, end.count)
+	for _, row := range rows[:end.count] {
 		items = append(items, sandboxResponse(row))
 	}
-	var next *string
-	if more {
-		last := rows[count-1]
-		next, err = NextCursor(CollectionSandboxes, projectID, last.CreatedAt, NewID(last.ID), true)
-		if err != nil {
-			WriteError(w, err)
-			return
-		}
-	}
-	WriteSandboxPage(w, http.StatusOK, NewSandboxPage(items, next))
+	WriteSandboxPage(w, http.StatusOK, NewSandboxPage(items, end.next))
 }
 
 func (s *Sandboxes) stop(w http.ResponseWriter, r *http.Request) {
@@ -140,7 +126,7 @@ func (s *Sandboxes) stop(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), s.timeout)
 	defer cancel()
 	if err := s.store.Stop(ctx, userID, sandboxID.UUID()); err != nil {
-		WriteError(w, stopFailure(err))
+		WriteError(w, resourceFailure(err))
 		return
 	}
 	WriteNoContent(w)
@@ -156,34 +142,7 @@ func sandboxResponse(row db.Sandbox) Sandbox {
 	)
 }
 
-func sandboxPage(span Span) sandboxes.Page {
-	page := sandboxes.Page{Limit: span.Limit()}
-	if !span.HasAfter() {
-		return page
-	}
-	after := span.After()
-	page.After = &sandboxes.Position{CreatedAt: after.CreatedAt(), ID: after.ID()}
-	return page
-}
-
-func listFailure(err error) error {
-	if errors.Is(err, sandboxes.ErrNotFound) {
-		return NotFound()
-	}
-	return persistenceFailure(err)
-}
-
-func stopFailure(err error) error {
-	if errors.Is(err, sandboxes.ErrNotFound) {
-		return NotFound()
-	}
-	return persistenceFailure(err)
-}
-
 func creationFailure(err error) error {
-	if errors.Is(err, sandboxes.ErrNotFound) {
-		return NotFound()
-	}
 	var limited *sandboxes.RateLimitedError
 	if errors.As(err, &limited) && limited != nil {
 		return RateLimited(limited.Remaining)
@@ -191,8 +150,8 @@ func creationFailure(err error) error {
 	if errors.Is(err, sandboxes.ErrQuotaExceeded) {
 		return QuotaExceeded()
 	}
-	if errors.Is(err, ratelimit.ErrUnavailable) || postgres.Unavailable(err) {
+	if errors.Is(err, ratelimit.ErrUnavailable) {
 		return ServiceUnavailable()
 	}
-	return err
+	return resourceFailure(err)
 }

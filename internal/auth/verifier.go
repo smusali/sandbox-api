@@ -123,10 +123,14 @@ func (v *Verifier) Verify(ctx context.Context, raw string) (Identity, error) {
 	if err := v.accept(claims); err != nil {
 		return Identity{}, invalidToken(err)
 	}
+	email, verified := claims.Email, claims.EmailVerified
+	if email == "" {
+		email, verified = claims.Ext.Email, claims.Ext.EmailVerified
+	}
 	return Identity{
 		Issuer:  v.issuer,
 		Subject: claims.Subject,
-		Email:   trustedEmail(claims.Email, claims.EmailVerified),
+		Email:   trustedEmail(email, verified),
 	}, nil
 }
 
@@ -134,6 +138,10 @@ type accessClaims struct {
 	jwt.Claims
 	Email         string `json:"email,omitempty"`
 	EmailVerified *bool  `json:"email_verified,omitempty"`
+	Ext           struct {
+		Email         string `json:"email,omitempty"`
+		EmailVerified *bool  `json:"email_verified,omitempty"`
+	} `json:"ext,omitempty"`
 }
 
 func (v *Verifier) accept(claims accessClaims) error {

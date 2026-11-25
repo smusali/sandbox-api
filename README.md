@@ -2,7 +2,7 @@
 
 Go 1.27.4 API for authenticated projects and sandboxes.
 
-`CASES.md` is the behavioral contract for the endpoints below. This file is the local setup and the reviewer walkthrough.
+This file is the local setup and the reviewer walkthrough.
 
 ## Project overview
 
@@ -31,7 +31,7 @@ Every member of a project can create sandboxes, list them, and stop them. A call
 - `internal/db/sqlc` is the generated database package.
 - `db/migrations` holds the Goose schema. `db/queries` holds the SQL that sqlc compiles.
 - `dev/hydra-login` is the local Hydra login and consent image.
-- `sqlc.yaml`, `docker-compose.yml`, `.env.example`, `CASES.md`, `go.mod`, and `go.sum` sit at the repository root.
+- `sqlc.yaml`, `docker-compose.yml`, `.env.example`, `go.mod`, and `go.sum` sit at the repository root.
 
 ## Prerequisites
 

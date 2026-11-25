@@ -19,6 +19,7 @@ var (
 	errAuthorizationRejected = errors.New("oauth authorization rejected")
 	errProviderResponse      = errors.New("oauth provider response invalid")
 	errProviderUnavailable   = errors.New("oauth provider unavailable")
+	errProviderBusy          = errors.New("oauth provider busy")
 	errRedirectRefused       = errors.New("oauth token redirect refused")
 )
 
@@ -64,8 +65,21 @@ func NewExchanger(clientID, clientSecret, redirectURI, tokenURL string, timeout 
 }
 
 // Exchange performs one authorization-code request.
+// A provider 500 is attempted again because the fixture can reject a concurrent write.
 // A timeout or a dropped connection is not retried.
 func (e *Exchanger) Exchange(ctx context.Context, code, verifier string) (accessToken, error) {
+	var token accessToken
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		token, err = e.exchangeOnce(ctx, code, verifier)
+		if !errors.Is(err, errProviderBusy) {
+			return token, err
+		}
+	}
+	return accessToken{}, errProviderUnavailable
+}
+
+func (e *Exchanger) exchangeOnce(ctx context.Context, code, verifier string) (accessToken, error) {
 	form := url.Values{
 		"grant_type":    {"authorization_code"},
 		"code":          {code},
@@ -90,7 +104,7 @@ func (e *Exchanger) Exchange(ctx context.Context, code, verifier string) (access
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= http.StatusInternalServerError {
-		return accessToken{}, errProviderUnavailable
+		return accessToken{}, errProviderBusy
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxTokenBody+1))

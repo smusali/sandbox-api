@@ -14,26 +14,13 @@ import (
 	"github.com/smusali/sandbox-api/internal/postgres"
 )
 
-type tokenVerifier interface {
-	Verify(ctx context.Context, raw string) (auth.Identity, error)
-}
-
-type userByIdentity interface {
-	GetUserByIdentity(ctx context.Context, arg db.GetUserByIdentityParams) (db.User, error)
-}
-
-var (
-	_ tokenVerifier  = (*auth.Verifier)(nil)
-	_ userByIdentity = (*db.Queries)(nil)
-)
-
 var errEmptyUserID = errors.New("registered user has an empty id")
 
 // Authenticate requires one verified access token and a registered user.
 // The user id is stored on the request context. A missing registration is
 // rejected. This middleware does not create users and does not decide
 // project membership.
-func Authenticate(verifier tokenVerifier, users userByIdentity, timeout time.Duration) Middleware {
+func Authenticate(verifier *auth.Verifier, users *db.Queries, timeout time.Duration) Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			ctx, cancel := context.WithTimeout(r.Context(), timeout)
@@ -48,7 +35,7 @@ func Authenticate(verifier tokenVerifier, users userByIdentity, timeout time.Dur
 	}
 }
 
-func authenticate(ctx context.Context, values []string, verifier tokenVerifier, users userByIdentity) (auth.Principal, error) {
+func authenticate(ctx context.Context, values []string, verifier *auth.Verifier, users *db.Queries) (auth.Principal, error) {
 	token, err := bearerToken(values)
 	if err != nil {
 		return auth.Principal{}, Unauthenticated()
